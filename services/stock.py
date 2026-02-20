@@ -23,14 +23,22 @@ def _pexels_request(url: str, params: dict, api_key: str) -> dict:
     import json
     import urllib.parse
     full_url = url + "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-    req = urllib.request.Request(full_url, headers={"Authorization": api_key})
+    req = urllib.request.Request(full_url, headers={
+        "Authorization": api_key,
+        "User-Agent": "Mozilla/5.0 (compatible; AI-VideoEditor/1.0)",
+    })
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
 
 
 def _download_file(url: str, dest: Path) -> Path:
     logger.info("Stock: скачиваем %s -> %s", url, dest)
-    urllib.request.urlretrieve(url, str(dest))
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; AI-VideoEditor/1.0)",
+    })
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
+        while chunk := resp.read(65536):
+            f.write(chunk)
     return dest
 
 
