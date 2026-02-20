@@ -199,11 +199,27 @@ function setProgressStep(step) {
   });
 }
 
+let veoAvailable = false;
+
+// Check AI video generation availability
+fetch("/capabilities").then(r => r.json()).then(data => {
+  veoAvailable = !!data.ai_video_generation;
+}).catch(() => { veoAvailable = false; });
+
 function renderSlotCards(suggestions) {
   slotCards.innerHTML = "";
   suggestions.forEach((slot, i) => {
     const card = document.createElement("div");
     card.className = "slot-card";
+    const modeToggle = veoAvailable ? `
+      <div class="slot-mode-row">
+        <span class="slot-mode-label">Источник:</span>
+        <div class="mode-toggle">
+          <button class="mode-btn active" data-index="${i}" data-mode="stock">🔍 Сток</button>
+          <button class="mode-btn" data-index="${i}" data-mode="ai">🤖 AI-генерация</button>
+        </div>
+      </div>` : "";
+
     card.innerHTML = `
       <div class="slot-card-header">
         <label class="slot-check-label">
@@ -213,18 +229,35 @@ function renderSlotCards(suggestions) {
         <span class="slot-time">${formatTime(slot.start)} – ${formatTime(slot.end)} · ${slot.duration}s</span>
       </div>
       <div class="slot-context">${escapeHtml(slot.context_text)}</div>
+      ${modeToggle}
       <div class="slot-query-row">
-        <span class="slot-query-label">🎬 Поиск в стоке:</span>
+        <span class="slot-query-label" id="query-label-${i}">🎬 Запрос для поиска:</span>
         <input type="text" class="slot-query-input" data-index="${i}" value="${escapeHtml(slot.query)}">
       </div>
     `;
     slotCards.appendChild(card);
   });
 
-  // Sync edits back to currentSuggestions
+  // Sync query edits
   slotCards.querySelectorAll(".slot-query-input").forEach(input => {
     input.addEventListener("input", () => {
       currentSuggestions[parseInt(input.dataset.index)].query = input.value;
+    });
+  });
+
+  // Mode toggle (stock vs AI)
+  slotCards.querySelectorAll(".mode-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.index);
+      const mode = btn.dataset.mode;
+      const group = slotCards.querySelectorAll(`.mode-btn[data-index="${idx}"]`);
+      group.forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      currentSuggestions[idx].mode = mode;
+      const label = document.getElementById(`query-label-${idx}`);
+      if (label) {
+        label.textContent = mode === "ai" ? "🤖 Промпт для AI:" : "🎬 Запрос для поиска:";
+      }
     });
   });
 }
@@ -246,6 +279,7 @@ applyBtn.addEventListener("click", async () => {
       query: queryInput ? queryInput.value : s.query,
       alternative_queries: s.alternative_queries || [],
       enabled: checkbox ? checkbox.checked : true,
+      mode: currentSuggestions[i].mode || "stock",
     };
   });
 

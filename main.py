@@ -142,6 +142,7 @@ class BrollSlot(BaseModel):
     query: str
     alternative_queries: list[str] = []
     enabled: bool = True
+    mode: str = "stock"  # "stock" or "ai"
 
 
 class BrollApplyRequest(BaseModel):
@@ -181,8 +182,25 @@ async def broll_apply(req: BrollApplyRequest):
         raise HTTPException(400, "No enabled slots to apply")
 
     def _apply():
+        import subprocess as _sp
         from services.stock import fetch_stock_media
+        from services.video_gen import generate_video_clip
         from services.executor import run_tasks
+
+        # Get source video dimensions for quality matching
+        r = _sp.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of",
+             "default=noprint_wrappers=1:nokey=1", str(input_path)],
+            capture_output=True, text=True,
+        )
+        lines = r.stdout.strip().splitlines()
+        src_w = int(lines[0]) if len(lines) >= 1 else 1080
+        src_h = int(lines[1]) if len(lines) >= 2 else 1920
+        # Pexels max_width: match source if portrait, otherwise 1920
+        max_width = min(src_w, src_h) if src_h > src_w else src_w  # shorter side for portrait
+        max_width = min(max_width, 1920)
+        orientation = "portrait" if src_h > src_w else "landscape"
 
         pre_registry: dict[str, Path] = {}
         overlay_tasks: list[dict] = []
@@ -190,16 +208,42 @@ async def broll_apply(req: BrollApplyRequest):
 
         for i, slot in enumerate(enabled_slots):
             oid = f"broll_{i + 1}"
-            media_path = fetch_stock_media(
-                query=slot.query,
-                media_type="video",
-                dest_dir=dest_dir,
-                duration_max=max(10, int(slot.duration) + 5),
-                orientation="landscape",
-                alternatives=slot.alternative_queries,
-            )
+            media_path: Path | None = None
+
+            if slot.mode == "ai":
+                # Build a cinematic Veo prompt from the query
+                veo_prompt = (
+                    f"Cinematic close-up footage: {slot.query}. "
+                    f"Professional video quality, smooth camera movement, no text or watermarks."
+                )
+                veo_path = dest_dir / f"ai_video_{oid}_{int(time.time())}.mp4"
+                media_path = generate_video_clip(
+                    prompt=veo_prompt,
+                    dest_path=veo_path,
+                    duration_seconds=max(5, int(slot.duration) + 1),
+                    aspect_ratio="9:16" if src_h > src_w else "16:9",
+                )
+                if media_path is None:
+                    # Fallback to stock if AI generation fails
+                    logger.warning("Veo не удался для '%s', пробуем сток", slot.query)
+                    media_path = fetch_stock_media(
+                        query=slot.query, media_type="video", dest_dir=dest_dir,
+                        duration_max=max(10, int(slot.duration) + 5),
+                        orientation=orientation, alternatives=slot.alternative_queries,
+                        max_width=max_width,
+                    )
+            else:
+                media_path = fetch_stock_media(
+                    query=slot.query, media_type="video", dest_dir=dest_dir,
+                    duration_max=max(10, int(slot.duration) + 5),
+                    orientation=orientation, alternatives=slot.alternative_queries,
+                    max_width=max_width,
+                )
+
             if media_path is None:
+                logger.warning("Не удалось получить клип для слота %d, пропуск", i + 1)
                 continue
+
             pre_registry[oid] = media_path
             overlay_tasks.append({
                 "type": "overlay_video",
@@ -211,7 +255,7 @@ async def broll_apply(req: BrollApplyRequest):
             })
 
         if not overlay_tasks:
-            raise RuntimeError("No stock clips could be found for any slot")
+            raise RuntimeError("No clips could be found for any enabled slot")
 
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
             temp_path = Path(tf.name)
@@ -228,6 +272,13 @@ async def broll_apply(req: BrollApplyRequest):
 
     download_url = storage.get_download_url(output_key, is_output=True)
     return ProcessResponse(output_key=output_key, download_url=download_url)
+
+
+@app.get("/capabilities")
+async def capabilities():
+    """Return available features (e.g. whether AI video gen is available)."""
+    from services.video_gen import is_veo_available
+    return {"ai_video_generation": is_veo_available()}
 
 
 @app.get("/files/{prefix}/{key:path}")

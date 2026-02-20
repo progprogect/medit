@@ -49,6 +49,7 @@ def fetch_stock_media(
     duration_max: int = 30,
     orientation: str = "landscape",
     alternatives: list[str] | None = None,
+    max_width: int = 1920,
 ) -> Path | None:
     """Search Pexels and download first suitable result.
 
@@ -62,7 +63,8 @@ def fetch_stock_media(
 
     try:
         if media_type == "video":
-            return _fetch_video(query, duration_max, orientation, dest_dir, api_key, alternatives or [])
+            return _fetch_video(query, duration_max, orientation, dest_dir, api_key,
+                                alternatives or [], max_width=max_width)
         else:
             return _fetch_image(query, orientation, dest_dir, api_key, alternatives or [])
     except Exception as e:
@@ -96,6 +98,7 @@ def _fallback_queries(query: str, alternatives: list[str] | None = None) -> list
 def _fetch_video(
     query: str, duration_max: int, orientation: str, dest_dir: Path, api_key: str,
     alternatives: list[str] | None = None,
+    max_width: int = 1920,
 ) -> Path | None:
     pexels_orientation = _map_orientation(orientation)
     videos: list = []
@@ -116,8 +119,7 @@ def _fetch_video(
         videos = data.get("videos", [])
         if videos:
             if attempt_query != query:
-                logger.info("Stock: видео не найдено по '%s', использую упрощённый запрос '%s'",
-                            query, attempt_query)
+                logger.info("Stock: видео не найдено по '%s', использую '%s'", query, attempt_query)
             break
 
     if not videos:
@@ -129,12 +131,13 @@ def _fetch_video(
     if not files:
         logger.warning("Stock: видео '%s' не имеет video_files", query)
         return None
-    # Prefer SD/HD file to keep size manageable
-    video_url = files[-1]["link"]
-    for f in files:
-        if f.get("width", 0) <= 1920:
-            video_url = f["link"]
-            break
+
+    # Pick the BEST quality that fits within max_width
+    eligible = [f for f in files if f.get("width", 0) <= max_width and f.get("link")]
+    best = eligible[-1] if eligible else files[-1]  # largest eligible, or absolute largest
+    video_url = best["link"]
+    logger.info("Stock: выбрано качество %dx%d для '%s'",
+                best.get("width", 0), best.get("height", 0), query)
 
     slug = query.replace(" ", "_")[:30]
     dest = dest_dir / f"stock_video_{slug}_{int(time.time())}.mp4"
