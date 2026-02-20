@@ -179,7 +179,7 @@ def detect_burned_subtitles(video_path: Path) -> bool:
     )
     try:
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[*frame_parts, prompt],
         )
         answer = (response.text or "").strip().upper()
