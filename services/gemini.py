@@ -3,6 +3,7 @@
 import json
 import logging
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -20,36 +21,52 @@ SYSTEM_INSTRUCTION = """You are a video editing assistant. Given a video, a tran
 
 CRITICAL RULE: Every task MUST have fully populated params. NEVER return empty params {}.
 
+GRAPH TASKS: Tasks support optional fields:
+  - "output_id": string — name this task's output for use by later tasks via "inputs"
+  - "inputs": [string, ...] — use named outputs of previous tasks as input instead of the linear chain
+
+Use output_id + inputs when you need to branch (e.g. trim two clips separately then concat them).
+Simple linear tasks do NOT need output_id or inputs.
+
 Task types with required params — use EXACTLY these formats:
 
 add_text_overlay — required: text, position, font_size, font_color; optional: start_time, end_time
   Example: {"type": "add_text_overlay", "params": {"text": "B2B лидогенерация — это реально", "position": "bottom_center", "font_size": 48, "font_color": "white", "start_time": 0.0, "end_time": 4.0}}
 
-trim — required: start, end (seconds)
-  Example: {"type": "trim", "params": {"start": 5.0, "end": 45.0}}
+trim — required: start, end (seconds). Can have output_id to save for concat.
+  Example: {"type": "trim", "params": {"start": 5.0, "end": 45.0}, "output_id": "clip_a"}
 
-resize — required: width; optional: height (omit to keep aspect ratio)
+resize — required: width; optional: height
   Example: {"type": "resize", "params": {"width": 1080, "height": 1920}}
 
-change_speed — required: factor (0.5 = slow 2x, 2.0 = fast 2x)
+change_speed — required: factor
   Example: {"type": "change_speed", "params": {"factor": 1.25}}
 
-add_subtitles — required: segments (array of objects with start, end, text — use timestamps from the transcript)
-  Example: {"type": "add_subtitles", "params": {"segments": [{"start": 0.0, "end": 3.5, "text": "Привет, я Никита"}, {"start": 3.5, "end": 7.0, "text": "Помогаю B2B компаниям"}]}}
+add_subtitles — required: segments (use timestamps from the transcript)
+  Example: {"type": "add_subtitles", "params": {"segments": [{"start": 0.0, "end": 3.5, "text": "Привет, я Никита"}]}}
 
 auto_frame_face — required: target_ratio
   Example: {"type": "auto_frame_face", "params": {"target_ratio": "9:16"}}
 
-color_correction — at least one of: brightness (-1..1), contrast (-1..1), saturation (-1..1)
-  Example: {"type": "color_correction", "params": {"brightness": 0.05, "contrast": 0.1, "saturation": 0.1}}
+color_correction — at least one of: brightness, contrast, saturation (-1..1)
+  Example: {"type": "color_correction", "params": {"brightness": 0.05, "contrast": 0.1}}
 
 zoompan — required: zoom, duration
   Example: {"type": "zoompan", "params": {"zoom": 1.2, "duration": 3.0}}
 
-concat — required: clip_paths (array of absolute file paths)
-  Example: {"type": "concat", "params": {"clip_paths": ["/path/a.mp4", "/path/b.mp4"]}}
+concat — preferred: use "inputs" with output_ids; fallback: clip_paths array
+  Example with graph: {"type": "concat", "params": {}, "inputs": ["clip_a", "broll_1", "clip_b"]}
+  Example legacy: {"type": "concat", "params": {"clip_paths": ["/path/a.mp4"]}}
 
-SELF-CHECK: Before returning — verify every task has non-empty params with all required fields filled. Verify timestamps are logical and match the transcript. Remove any task with empty params.
+fetch_stock_video — find and download a stock video clip. Required: query. Optional: duration_max (sec), orientation (landscape/portrait/square).
+  MUST have output_id so the clip can be used in later tasks.
+  Example: {"type": "fetch_stock_video", "params": {"query": "business meeting", "duration_max": 10, "orientation": "landscape"}, "output_id": "broll_1"}
+
+fetch_stock_image — find and download a stock image. Required: query. Optional: orientation.
+  MUST have output_id.
+  Example: {"type": "fetch_stock_image", "params": {"query": "data chart blue", "orientation": "landscape"}, "output_id": "graph_img"}
+
+SELF-CHECK: Before returning — verify every task has non-empty params. Verify timestamps are logical. Remove any task with empty params.
 
 Generate ONLY valid JSON. No markdown. Tasks execute in order."""
 
@@ -70,27 +87,25 @@ PLAN_JSON_SCHEMA = {
                             "add_text_overlay", "trim", "resize", "change_speed",
                             "add_subtitles", "add_image_overlay", "auto_frame_face",
                             "color_correction", "concat", "zoompan",
+                            "fetch_stock_video", "fetch_stock_image",
                         ],
                     },
+                    "output_id": {"type": "string"},
+                    "inputs": {"type": "array", "items": {"type": "string"}},
                     "params": {
                         "type": "object",
                         "properties": {
-                            # add_text_overlay
                             "text": {"type": "string"},
                             "position": {"type": "string"},
                             "font_size": {"type": "integer"},
                             "font_color": {"type": "string"},
                             "start_time": {"type": "number"},
                             "end_time": {"type": "number"},
-                            # trim
                             "start": {"type": "number"},
                             "end": {"type": "number"},
-                            # resize
                             "width": {"type": "integer"},
                             "height": {"type": "integer"},
-                            # change_speed
                             "factor": {"type": "number"},
-                            # add_subtitles
                             "segments": {
                                 "type": "array",
                                 "items": {
@@ -103,23 +118,19 @@ PLAN_JSON_SCHEMA = {
                                     "required": ["start", "end", "text"],
                                 },
                             },
-                            # add_image_overlay
                             "image_path": {"type": "string"},
                             "opacity": {"type": "number"},
-                            # auto_frame_face
                             "target_ratio": {"type": "string"},
-                            # color_correction
                             "brightness": {"type": "number"},
                             "contrast": {"type": "number"},
                             "saturation": {"type": "number"},
-                            # concat
-                            "clip_paths": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                            # zoompan
+                            "clip_paths": {"type": "array", "items": {"type": "string"}},
                             "zoom": {"type": "number"},
                             "duration": {"type": "number"},
+                            # fetch_stock_*
+                            "query": {"type": "string"},
+                            "duration_max": {"type": "integer"},
+                            "orientation": {"type": "string"},
                         },
                     },
                 },
@@ -129,6 +140,55 @@ PLAN_JSON_SCHEMA = {
     },
     "required": ["scenario_name", "scenario_description", "metadata", "tasks"],
 }
+
+
+def detect_burned_subtitles(video_path: Path) -> bool:
+    """Check if video has burned-in (hardcoded) subtitles by sampling frames with Gemini Vision."""
+    api_key = get_gemini_api_key()
+    client = genai.Client(api_key=api_key)
+
+    # Extract 4 frames evenly spaced through the video
+    duration = _get_video_duration(video_path)
+    if duration <= 0:
+        return False
+
+    frame_times = [duration * t for t in (0.1, 0.33, 0.66, 0.9)]
+    frame_parts = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for idx, ts in enumerate(frame_times):
+            frame_path = Path(tmpdir) / f"frame_{idx}.jpg"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-ss", str(ts), "-i", str(video_path),
+                 "-vframes", "1", "-q:v", "3", str(frame_path)],
+                capture_output=True,
+            )
+            if result.returncode == 0 and frame_path.exists():
+                frame_data = frame_path.read_bytes()
+                frame_parts.append(
+                    types.Part.from_bytes(data=frame_data, mime_type="image/jpeg")
+                )
+
+    if not frame_parts:
+        return False
+
+    prompt = (
+        "Look at these video frames. Do you see any burned-in (hardcoded) subtitles or captions "
+        "as text overlaid on the video picture itself (not UI elements, not titles, "
+        "but subtitle text at the bottom or sides of the frame)? "
+        "Answer with a single word: YES or NO."
+    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[*frame_parts, prompt],
+        )
+        answer = (response.text or "").strip().upper()
+        result = "YES" in answer
+        logger.info("detect_burned_subtitles: ответ Gemini='%s' → %s", answer, result)
+        return result
+    except Exception as e:
+        logger.warning("detect_burned_subtitles: ошибка %s, считаем False", e)
+        return False
 
 
 def _get_video_duration(video_path: Path) -> float:
@@ -170,6 +230,11 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
     transcript_text, transcript_segments, _ = transcribe(video_path)
     logger.info("Gemini: транскрипция заняла %.1f сек", time.time() - t0)
 
+    t0 = time.time()
+    logger.info("Gemini: проверка наличия burned-in субтитров...")
+    has_burned_subs = detect_burned_subtitles(video_path)
+    logger.info("Gemini: burned-in субтитры = %s (%.1f сек)", has_burned_subs, time.time() - t0)
+
     if use_files_api:
         t0 = time.time()
         logger.info("Gemini: загрузка видео в Files API...")
@@ -201,14 +266,21 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
         if transcript_text else ""
     )
 
+    burned_subs_note = (
+        "NOTE: This video already has burned-in (hardcoded) subtitles visible on the frames. "
+        "Do NOT add an add_subtitles task.\n\n"
+        if has_burned_subs else ""
+    )
+
     prompt_parts = [
         transcript_block,
+        burned_subs_note,
         f"User request: {user_prompt}\n\n"
         "Return JSON with scenario_name, scenario_description, metadata (e.g. YouTube timestamps), and tasks array. "
         "EVERY task must have fully filled params — never empty {}.",
     ]
 
-    prompt = "".join(prompt_parts)
+    prompt = "".join(p for p in prompt_parts if p)
 
     t_gen = time.time()
     logger.info("Gemini: вызов generate_content...")

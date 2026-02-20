@@ -39,6 +39,16 @@ def get_upload_dir() -> Path:
     return path
 
 
+def get_pexels_api_key() -> str:
+    """Get Pexels API key for stock media search. Optional — raises ValueError if not set."""
+    key = os.environ.get("PEXELS_API_KEY")
+    if not key:
+        raise ValueError(
+            "PEXELS_API_KEY is not set. Add it to .env to enable stock media search."
+        )
+    return key
+
+
 def get_output_dir() -> Path:
     """Directory for processed output files (local mode)."""
     path = Path(os.environ.get("OUTPUT_DIR", "outputs"))

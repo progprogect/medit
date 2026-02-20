@@ -47,6 +47,8 @@ TaskType = Literal[
     "color_correction",
     "concat",
     "zoompan",
+    "fetch_stock_video",
+    "fetch_stock_image",
 ]
 
 
@@ -55,6 +57,8 @@ class Task(BaseModel):
 
     type: TaskType
     params: dict[str, Any]
+    output_id: str | None = None   # имя результата для ссылки из других задач через inputs
+    inputs: list[str] | None = None  # ссылки на output_id предыдущих задач
 
 
 class PlanResponse(BaseModel):

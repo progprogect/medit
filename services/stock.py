@@ -1,0 +1,125 @@
+"""Stock media search and download via Pexels API."""
+
+import logging
+import time
+import urllib.request
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+PEXELS_VIDEO_SEARCH = "https://api.pexels.com/videos/search"
+PEXELS_IMAGE_SEARCH = "https://api.pexels.com/v1/search"
+
+
+def _get_api_key() -> str | None:
+    from config import get_pexels_api_key
+    try:
+        return get_pexels_api_key()
+    except ValueError:
+        return None
+
+
+def _pexels_request(url: str, params: dict, api_key: str) -> dict:
+    import json
+    import urllib.parse
+    full_url = url + "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    req = urllib.request.Request(full_url, headers={"Authorization": api_key})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def _download_file(url: str, dest: Path) -> Path:
+    logger.info("Stock: скачиваем %s -> %s", url, dest)
+    urllib.request.urlretrieve(url, str(dest))
+    return dest
+
+
+def fetch_stock_media(
+    query: str,
+    media_type: str,
+    dest_dir: Path,
+    duration_max: int = 30,
+    orientation: str = "landscape",
+) -> Path | None:
+    """Search Pexels and download first suitable result.
+
+    media_type: 'video' or 'image'
+    Returns Path to downloaded file, or None if not found / API key missing.
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        logger.warning("Stock: PEXELS_API_KEY не задан, пропуск поиска")
+        return None
+
+    try:
+        if media_type == "video":
+            return _fetch_video(query, duration_max, orientation, dest_dir, api_key)
+        else:
+            return _fetch_image(query, orientation, dest_dir, api_key)
+    except Exception as e:
+        logger.error("Stock: ошибка при поиске '%s': %s", query, e)
+        return None
+
+
+def _fetch_video(
+    query: str, duration_max: int, orientation: str, dest_dir: Path, api_key: str
+) -> Path | None:
+    pexels_orientation = _map_orientation(orientation)
+    data = _pexels_request(
+        PEXELS_VIDEO_SEARCH,
+        {
+            "query": query,
+            "per_page": 5,
+            "orientation": pexels_orientation,
+            "max_duration": duration_max,
+        },
+        api_key,
+    )
+    videos = data.get("videos", [])
+    if not videos:
+        logger.warning("Stock: видео по запросу '%s' не найдено", query)
+        return None
+
+    video = videos[0]
+    # Prefer SD/HD file to keep size manageable
+    files = sorted(video.get("video_files", []), key=lambda f: f.get("width", 0))
+    for f in files:
+        if f.get("width", 0) <= 1920:
+            video_url = f["link"]
+            break
+    else:
+        video_url = files[-1]["link"]
+
+    slug = query.replace(" ", "_")[:30]
+    dest = dest_dir / f"stock_video_{slug}_{int(time.time())}.mp4"
+    return _download_file(video_url, dest)
+
+
+def _fetch_image(
+    query: str, orientation: str, dest_dir: Path, api_key: str
+) -> Path | None:
+    pexels_orientation = _map_orientation(orientation)
+    data = _pexels_request(
+        PEXELS_IMAGE_SEARCH,
+        {
+            "query": query,
+            "per_page": 5,
+            "orientation": pexels_orientation,
+        },
+        api_key,
+    )
+    photos = data.get("photos", [])
+    if not photos:
+        logger.warning("Stock: изображение по запросу '%s' не найдено", query)
+        return None
+
+    photo = photos[0]
+    image_url = photo["src"].get("large", photo["src"]["original"])
+    slug = query.replace(" ", "_")[:30]
+    dest = dest_dir / f"stock_image_{slug}_{int(time.time())}.jpg"
+    return _download_file(image_url, dest)
+
+
+def _map_orientation(orientation: str) -> str:
+    mapping = {"portrait": "portrait", "square": "square"}
+    return mapping.get(orientation, "landscape")
