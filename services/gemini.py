@@ -53,8 +53,82 @@ SELF-CHECK: Before returning — verify every task has non-empty params with all
 
 Generate ONLY valid JSON. No markdown. Tasks execute in order."""
 
-# Схема не используется — response_schema ограничивает Gemini и приводит к пустым params.
-# Вместо этого используем response_mime_type=application/json + детальный системный промпт.
+PLAN_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scenario_name": {"type": "string"},
+        "scenario_description": {"type": "string"},
+        "metadata": {"type": "object"},
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": [
+                            "add_text_overlay", "trim", "resize", "change_speed",
+                            "add_subtitles", "add_image_overlay", "auto_frame_face",
+                            "color_correction", "concat", "zoompan",
+                        ],
+                    },
+                    "params": {
+                        "type": "object",
+                        "properties": {
+                            # add_text_overlay
+                            "text": {"type": "string"},
+                            "position": {"type": "string"},
+                            "font_size": {"type": "integer"},
+                            "font_color": {"type": "string"},
+                            "start_time": {"type": "number"},
+                            "end_time": {"type": "number"},
+                            # trim
+                            "start": {"type": "number"},
+                            "end": {"type": "number"},
+                            # resize
+                            "width": {"type": "integer"},
+                            "height": {"type": "integer"},
+                            # change_speed
+                            "factor": {"type": "number"},
+                            # add_subtitles
+                            "segments": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "start": {"type": "number"},
+                                        "end": {"type": "number"},
+                                        "text": {"type": "string"},
+                                    },
+                                    "required": ["start", "end", "text"],
+                                },
+                            },
+                            # add_image_overlay
+                            "image_path": {"type": "string"},
+                            "opacity": {"type": "number"},
+                            # auto_frame_face
+                            "target_ratio": {"type": "string"},
+                            # color_correction
+                            "brightness": {"type": "number"},
+                            "contrast": {"type": "number"},
+                            "saturation": {"type": "number"},
+                            # concat
+                            "clip_paths": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            # zoompan
+                            "zoom": {"type": "number"},
+                            "duration": {"type": "number"},
+                        },
+                    },
+                },
+                "required": ["type", "params"],
+            },
+        },
+    },
+    "required": ["scenario_name", "scenario_description", "metadata", "tasks"],
+}
 
 
 def _get_video_duration(video_path: Path) -> float:
@@ -144,6 +218,7 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
         config={
             "system_instruction": SYSTEM_INSTRUCTION,
             "response_mime_type": "application/json",
+            "response_schema": PLAN_JSON_SCHEMA,
         },
     )
 
