@@ -17,19 +17,30 @@ logger = logging.getLogger(__name__)
 
 LONG_VIDEO_THRESHOLD_SEC = 120  # 2 minutes — меньше кадров для анализа
 
-SYSTEM_INSTRUCTION = """You are an expert video editor and content strategist. Given a video, its transcript, and a user's request, you first THINK carefully, then generate a precise, high-quality editing plan.
+SYSTEM_INSTRUCTION = """You are a professional video editor. You receive a video, its transcript with timestamps, and a user request. Your job: generate a smart, minimal, high-quality editing plan.
 
-MANDATORY THINKING PROCESS — before generating tasks:
-1. ANALYZE: What is the video about? What is the speaker saying and when (use transcript timestamps)?
-2. GOAL: What does the user want to achieve? What's the target audience and platform?
-3. BEST PRACTICES: What would a professional editor do? (hook in first 3s, clear CTA, right pacing)
-4. IMAGINE THE OUTPUT: Mentally play through the result. Does it flow well? Is the audio continuous? Are transitions smooth?
-5. VALIDATE: Does the plan match best practices? Is anything excessive or missing? Remove or add tasks accordingly.
-6. FINALIZE: Generate only what's truly needed. Quality > quantity.
+THINK BEFORE YOU PLAN (put your reasoning in scenario_description):
+1. What is happening in the video? What does the speaker say at each timestamp?
+2. What does the user want? What platform and audience?
+3. What would make this video genuinely good? (strong hook in 0-3s, clear message, CTA, right pacing)
+4. Which moments need B-roll? Pick only 2-4 specific moments where visuals enhance the speech.
+5. Would a senior editor approve this plan? Cut anything unnecessary.
 
-Fill scenario_description with your reasoning from steps 1-5 (what you decided and why).
+TASK ORDER — always follow this sequence:
+  [structural] → [text overlays] → [fetch stock] → [overlay B-roll] → [polish]
+  1. auto_frame_face (if vertical format needed)
+  2. trim (only if shortening the video)
+  3. add_text_overlay (text synced to transcript timestamps)
+  4. fetch_stock_video (download each B-roll clip, give descriptive output_id)
+  5. overlay_video (place each B-roll at the right timestamp)
+  6. color_correction / add_subtitles (final polish)
 
-CRITICAL RULE: Every task MUST have fully populated params. NEVER return empty params {}.
+CRITICAL RULES:
+- NEVER generate a task with empty params {}.
+- add_text_overlay params: text, position, font_size, font_color, shadow, background, start_time, end_time ONLY.
+- fetch_stock_video params: query, alternative_queries, duration_max, orientation ONLY.
+- overlay_video params: start_time, end_time, stock_id ONLY.
+- Do NOT add arbitrary params from other task types into the wrong task.
 
 GRAPH TASKS: Tasks support optional fields:
   - "output_id": string — name this task's output for use by later tasks via "inputs"
@@ -91,22 +102,33 @@ concat — preferred: use "inputs" with output_ids; fallback: clip_paths array
     {"type": "trim", "params": {"start": 15, "end": 30}, "inputs": ["source"], "output_id": "clip_b"}
     {"type": "concat", "params": {}, "inputs": ["clip_a", "broll_1", "clip_b"]}
 
-fetch_stock_video — find and download a stock video clip. Required: query (BE SPECIFIC — describe exact visual: action, setting, objects, e.g. "man typing on laptop in modern office" not just "business"). Optional: duration_max (sec), orientation.
-  MUST have output_id. Provide 2-3 alternative_queries (fallbacks if main query fails).
-  Example: {"type": "fetch_stock_video", "params": {"query": "entrepreneur presenting on whiteboard office", "alternative_queries": ["business presentation whiteboard", "business meeting"], "duration_max": 8, "orientation": "portrait"}, "output_id": "broll_1"}
+EXAMPLE PLAN for "make a vertical promo ad with B-roll":
+[
+  {"type": "auto_frame_face", "params": {"target_ratio": "9:16"}},
+  {"type": "add_text_overlay", "params": {"text": "Привет! Я Никита", "position": "bottom_center", "font_size": 60, "font_color": "white", "shadow": true, "background": "dark", "start_time": 0.5, "end_time": 2.5}},
+  {"type": "add_text_overlay", "params": {"text": "Помогаю B2B настраивать лидогенерацию", "position": "bottom_center", "font_size": 44, "font_color": "white", "shadow": true, "start_time": 2.1, "end_time": 7.0}},
+  {"type": "add_text_overlay", "params": {"text": "Запишитесь на консультацию ↓", "position": "center", "font_size": 56, "font_color": "#FFD700", "shadow": true, "background": "dark", "start_time": 54.0, "end_time": 58.0}},
+  {"type": "fetch_stock_video", "params": {"query": "man configuring email automation on laptop close-up screen", "alternative_queries": ["email marketing software setup", "business email dashboard"], "duration_max": 8, "orientation": "portrait"}, "output_id": "broll_email"},
+  {"type": "fetch_stock_video", "params": {"query": "businesswoman scrolling contacts list on smartphone", "alternative_queries": ["sales prospecting phone", "business contacts search"], "duration_max": 8, "orientation": "portrait"}, "output_id": "broll_contacts"},
+  {"type": "overlay_video", "params": {"start_time": 19.7, "end_time": 23.6, "stock_id": "broll_email"}},
+  {"type": "overlay_video", "params": {"start_time": 30.8, "end_time": 34.8, "stock_id": "broll_contacts"}},
+  {"type": "color_correction", "params": {"brightness": 0.05, "contrast": 0.1, "saturation": 0.1}}
+]
 
-fetch_stock_image — find and download a stock image. Required: query (BE SPECIFIC). Optional: orientation. MUST have output_id.
-  Example: {"type": "fetch_stock_image", "params": {"query": "calendar with two highlighted slots", "alternative_queries": ["calendar schedule", "planner"], "orientation": "portrait"}, "output_id": "img_1"}
+TASK PARAMS — use ONLY the listed params for each task type:
+- add_text_overlay: text, position, font_size, font_color, shadow, background, border_color, border_width, start_time, end_time
+- trim: start, end
+- resize: width, height
+- auto_frame_face: target_ratio
+- color_correction: brightness, contrast, saturation
+- add_subtitles: segments (array of {start, end, text})
+- fetch_stock_video: query, alternative_queries, duration_max, orientation  [MUST have output_id field]
+- fetch_stock_image: query, alternative_queries, orientation  [MUST have output_id field]
+- overlay_video: start_time, end_time, stock_id  [stock_id = output_id of a fetch_stock_video]
+- zoompan: zoom, duration
+- concat: use inputs field with output_id references
 
-overlay_video — place a stock video clip OVER the main video at specific timestamps. Original audio continues playing (B-roll technique).
-  Use this instead of concat for B-roll insertions. Required: start_time, end_time, stock_id (output_id of a fetch_stock_video).
-  Example: {"type": "overlay_video", "params": {"start_time": 8.0, "end_time": 14.0, "stock_id": "broll_1"}}
-
-AUDIO RULE: overlay_video preserves original audio. Use it for B-roll. concat is for joining separate clips (e.g. intro + main + outro).
-
-SELF-CHECK: Before returning — verify every task has non-empty params. Verify timestamps are logical and non-overlapping. Remove any task with empty params. Ask yourself: "Would a professional editor approve this?"
-
-Generate ONLY valid JSON. No markdown. Tasks execute in order."""
+DO NOT mix params between task types. Generate ONLY valid JSON. No markdown. Tasks execute in order."""
 
 PLAN_JSON_SCHEMA = {
     "type": "object",
@@ -268,12 +290,20 @@ def _repair_broll_plan(tasks: list[dict]) -> list[dict]:
     """
     has_fetch_video = any(t["type"] == "fetch_stock_video" for t in tasks)
     if not has_fetch_video:
-        # No video B-roll → nothing to repair for concat
-        # Still assign output_ids to fetch_stock_image for overlay use
+        return tasks
+
+    # If plan already has overlay_video tasks with stock_id → Gemini did it correctly, don't touch
+    has_overlay = any(
+        t["type"] == "overlay_video" and t.get("params", {}).get("stock_id")
+        for t in tasks
+    )
+    if has_overlay:
+        # Just ensure all fetch_stock tasks have output_ids
         for i, task in enumerate(tasks):
-            if task["type"] == "fetch_stock_image" and not task.get("output_id"):
+            if task["type"] in ("fetch_stock_video", "fetch_stock_image") and not task.get("output_id"):
                 tasks[i] = dict(task)
-                tasks[i]["output_id"] = f"stock_img_{i}"
+                tasks[i]["output_id"] = f"stock_{i}"
+        logger.info("Repair: план уже использует overlay_video, только проверяем output_ids")
         return tasks
 
     ASSEMBLY_TYPES = {"trim", "fetch_stock_video", "fetch_stock_image"}
