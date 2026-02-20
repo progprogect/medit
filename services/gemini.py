@@ -53,33 +53,8 @@ SELF-CHECK: Before returning — verify every task has non-empty params with all
 
 Generate ONLY valid JSON. No markdown. Tasks execute in order."""
 
-PLAN_JSON_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "scenario_name": {"type": "string"},
-        "scenario_description": {"type": "string"},
-        "metadata": {"type": "object"},
-        "tasks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": [
-                            "add_text_overlay", "trim", "resize", "change_speed",
-                            "add_subtitles", "add_image_overlay", "auto_frame_face",
-                            "color_correction", "concat", "zoompan",
-                        ],
-                    },
-                    "params": {"type": "object"},
-                },
-                "required": ["type", "params"],
-            },
-        },
-    },
-    "required": ["scenario_name", "scenario_description", "metadata", "tasks"],
-}
+# Схема не используется — response_schema ограничивает Gemini и приводит к пустым params.
+# Вместо этого используем response_mime_type=application/json + детальный системный промпт.
 
 
 def _get_video_duration(video_path: Path) -> float:
@@ -169,7 +144,6 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
         config={
             "system_instruction": SYSTEM_INSTRUCTION,
             "response_mime_type": "application/json",
-            "response_schema": PLAN_JSON_SCHEMA,
         },
     )
 
