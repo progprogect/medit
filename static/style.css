@@ -176,6 +176,16 @@ h1 {
   font-weight: 600;
 }
 
+.scan-hint {
+  margin: 8px 0 0;
+  font-size: 0.82rem;
+  color: #999;
+}
+
+.scan-hint.hidden {
+  display: none !important;
+}
+
 .scan-eta {
   color: #888;
   font-size: 0.85rem;

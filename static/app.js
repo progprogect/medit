@@ -4,6 +4,7 @@ let selectedMaxInserts = 3;
 let currentSuggestions = [];
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
+const scanHint      = document.getElementById("scanHint");
 const dropzone      = document.getElementById("dropzone");
 const fileInput     = document.getElementById("fileInput");
 const dropzoneText  = document.getElementById("dropzoneText");
@@ -69,6 +70,7 @@ function formatTime(sec) {
 function updateButtons() {
   const hasVideo = !!videoKey;
   scanBtn.disabled = !hasVideo;
+  if (scanHint) scanHint.classList.toggle("hidden", hasVideo);
   analyzeBtn.disabled = !(hasVideo && prompt.value.trim());
 }
 
