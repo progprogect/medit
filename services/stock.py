@@ -69,23 +69,47 @@ def fetch_stock_media(
         return None
 
 
+def _fallback_queries(query: str) -> list[str]:
+    """Generate progressively simpler fallback queries from the original."""
+    words = query.split()
+    candidates = [query]
+    if len(words) > 3:
+        candidates.append(" ".join(words[:3]))
+    if len(words) > 1:
+        candidates.append(words[0])
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    return [q for q in candidates if not (q in seen or seen.add(q))]  # type: ignore[func-returns-value]
+
+
 def _fetch_video(
     query: str, duration_max: int, orientation: str, dest_dir: Path, api_key: str
 ) -> Path | None:
     pexels_orientation = _map_orientation(orientation)
-    data = _pexels_request(
-        PEXELS_VIDEO_SEARCH,
-        {
-            "query": query,
-            "per_page": 5,
-            "orientation": pexels_orientation,
-            "max_duration": duration_max,
-        },
-        api_key,
-    )
-    videos = data.get("videos", [])
+    videos: list = []
+    tried: list[str] = []
+
+    for attempt_query in _fallback_queries(query):
+        tried.append(attempt_query)
+        data = _pexels_request(
+            PEXELS_VIDEO_SEARCH,
+            {
+                "query": attempt_query,
+                "per_page": 5,
+                "orientation": pexels_orientation,
+                "max_duration": duration_max,
+            },
+            api_key,
+        )
+        videos = data.get("videos", [])
+        if videos:
+            if attempt_query != query:
+                logger.info("Stock: видео не найдено по '%s', использую упрощённый запрос '%s'",
+                            query, attempt_query)
+            break
+
     if not videos:
-        logger.warning("Stock: видео по запросу '%s' не найдено", query)
+        logger.warning("Stock: видео не найдено ни по одному из запросов: %s", tried)
         return None
 
     video = videos[0]
@@ -109,18 +133,29 @@ def _fetch_image(
     query: str, orientation: str, dest_dir: Path, api_key: str
 ) -> Path | None:
     pexels_orientation = _map_orientation(orientation)
-    data = _pexels_request(
-        PEXELS_IMAGE_SEARCH,
-        {
-            "query": query,
-            "per_page": 5,
-            "orientation": pexels_orientation,
-        },
-        api_key,
-    )
-    photos = data.get("photos", [])
+    photos: list = []
+    tried: list[str] = []
+
+    for attempt_query in _fallback_queries(query):
+        tried.append(attempt_query)
+        data = _pexels_request(
+            PEXELS_IMAGE_SEARCH,
+            {
+                "query": attempt_query,
+                "per_page": 5,
+                "orientation": pexels_orientation,
+            },
+            api_key,
+        )
+        photos = data.get("photos", [])
+        if photos:
+            if attempt_query != query:
+                logger.info("Stock: изображение не найдено по '%s', использую '%s'",
+                            query, attempt_query)
+            break
+
     if not photos:
-        logger.warning("Stock: изображение по запросу '%s' не найдено", query)
+        logger.warning("Stock: изображение не найдено ни по одному из запросов: %s", tried)
         return None
 
     photo = photos[0]
