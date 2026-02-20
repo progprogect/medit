@@ -143,18 +143,19 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
 
     font = _get_default_font()
     temp_paths: list[Path] = []
-    # Maps output_id -> Path
-    registry: dict[str, Path] = {}
+    # Maps output_id -> Path. "source" always points to the original input.
+    registry: dict[str, Path] = {"source": input_path}
     # Default linear chain pointer
     current_path: Path = input_path
 
-    def _register(task: dict, result_path: Path) -> None:
-        """Store result in registry and advance current_path."""
+    def _register(task: dict, result_path: Path, advance_chain: bool = True) -> None:
+        """Store result in registry and optionally advance the linear current_path."""
         nonlocal current_path
         output_id = task.get("output_id")
         if output_id:
             registry[output_id] = result_path
-        current_path = result_path
+        if advance_chain:
+            current_path = result_path
 
     def _resolve_input(task: dict) -> Path:
         """Resolve primary input for a task."""
@@ -460,7 +461,9 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
                                task_type, query)
                 continue
             temp_paths.append(media_path)
-            _register(task, media_path)
+            # fetch_stock tasks only put media into the registry for later use;
+            # they must NOT override current_path so linear chain stays on the main video
+            _register(task, media_path, advance_chain=False)
             logger.info("Executor: %s скачано за %.1f сек: %s",
                         task_type, time.time() - t0, media_path)
 

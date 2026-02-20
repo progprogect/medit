@@ -25,8 +25,14 @@ GRAPH TASKS: Tasks support optional fields:
   - "output_id": string — name this task's output for use by later tasks via "inputs"
   - "inputs": [string, ...] — use named outputs of previous tasks as input instead of the linear chain
 
-Use output_id + inputs when you need to branch (e.g. trim two clips separately then concat them).
-Simple linear tasks do NOT need output_id or inputs.
+Special registry key: "source" always refers to the ORIGINAL uploaded video.
+
+Use output_id + inputs when you need to:
+  1. Cut multiple segments from the original video to later concat them.
+  2. Mix original video segments with stock B-roll.
+In these cases EVERY trim that cuts from the original MUST use inputs: ["source"] and have an output_id.
+fetch_stock_* tasks MUST have an output_id and are automatically placed in the registry (they do NOT change the current chain).
+Simple linear tasks (single add_text_overlay, resize, etc.) do NOT need output_id or inputs.
 
 Task types with required params — use EXACTLY these formats:
 
@@ -42,8 +48,11 @@ add_text_overlay — required: text, font_size, font_color; position OR (x, y); 
     {"type": "add_text_overlay", "params": {"text": "B2B лидогенерация", "position": "bottom_center", "font_size": 56, "font_color": "white", "shadow": true, "background": "dark", "start_time": 0.0, "end_time": 4.0}}
     {"type": "add_text_overlay", "params": {"text": "Привет!", "x": "(w-text_w)/2", "y": "h*0.15", "font_size": 64, "font_color": "#FFD700", "border_color": "black", "border_width": 3, "start_time": 0.0, "end_time": 2.0}}
 
-trim — required: start, end (seconds). Can have output_id to save for concat.
-  Example: {"type": "trim", "params": {"start": 5.0, "end": 45.0}, "output_id": "clip_a"}
+trim — required: start, end (seconds).
+  If cutting from original for concat: use inputs: ["source"] and set output_id.
+  Example single trim: {"type": "trim", "params": {"start": 5.0, "end": 45.0}}
+  Example for concat: {"type": "trim", "params": {"start": 5.0, "end": 20.0}, "inputs": ["source"], "output_id": "clip_a"}
+  Example with stock: {"type": "trim", "params": {"start": 20.0, "end": 40.0}, "inputs": ["source"], "output_id": "clip_b"}
 
 resize — required: width; optional: height
   Example: {"type": "resize", "params": {"width": 1080, "height": 1920}}
@@ -66,6 +75,11 @@ zoompan — required: zoom, duration
 concat — preferred: use "inputs" with output_ids; fallback: clip_paths array
   Example with graph: {"type": "concat", "params": {}, "inputs": ["clip_a", "broll_1", "clip_b"]}
   Example legacy: {"type": "concat", "params": {"clip_paths": ["/path/a.mp4"]}}
+  Full B-roll example (trim source + fetch stock + concat):
+    {"type": "trim", "params": {"start": 0, "end": 15}, "inputs": ["source"], "output_id": "clip_a"}
+    {"type": "fetch_stock_video", "params": {"query": "business meeting", "duration_max": 8}, "output_id": "broll_1"}
+    {"type": "trim", "params": {"start": 15, "end": 30}, "inputs": ["source"], "output_id": "clip_b"}
+    {"type": "concat", "params": {}, "inputs": ["clip_a", "broll_1", "clip_b"]}
 
 fetch_stock_video — find and download a stock video clip. Required: query. Optional: duration_max (sec), orientation (landscape/portrait/square).
   MUST have output_id so the clip can be used in later tasks.
