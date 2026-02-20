@@ -552,3 +552,83 @@ def analyze_and_generate_tasks(video_path: Path, user_prompt: str) -> list[dict]
     """Legacy: analyze and return tasks only."""
     plan = analyze_and_generate_plan(video_path, user_prompt)
     return plan["tasks"]
+
+
+def scan_broll_suggestions(
+    video_path: Path,
+    max_inserts: int = 3,
+    model: str = "gemini-2.5-flash",
+) -> list[dict]:
+    """Scan video and return B-roll insertion suggestions.
+
+    Returns list of:
+    {start, end, context_text, query, alternative_queries}
+    """
+    from services.transcriber import transcribe
+
+    api_key = get_gemini_api_key()
+    client = genai.Client(api_key=api_key)
+
+    rules = dict(BROLL_RULES)
+    rules["max_inserts"] = max_inserts
+
+    duration_sec = _get_video_duration(video_path)
+
+    t0 = time.time()
+    logger.info("BrollScan: транскрипция...")
+    transcript_text, transcript_segments, _ = transcribe(video_path)
+    logger.info("BrollScan: транскрипция %.1f сек", time.time() - t0)
+
+    # Step 1: compute slots deterministically
+    slots = find_broll_slots(transcript_segments, duration_sec, rules)
+    if not slots:
+        return []
+
+    # Step 2: ask Gemini for stock queries for each slot
+    slots_context = [
+        {"slot_index": i + 1, "start": s["start"], "end": s["end"],
+         "speech_at_this_moment": s["context_text"]}
+        for i, s in enumerate(slots)
+    ]
+
+    prompt = (
+        f"Full transcript:\n{transcript_text[:8000]}\n\n"
+        f"B-roll slots where stock footage will be inserted:\n{json.dumps(slots_context, ensure_ascii=False, indent=2)}\n\n"
+        "For each slot, suggest a specific stock video search query that VISUALLY illustrates "
+        "what the speaker is saying at that moment. Be specific about the visual scene.\n\n"
+        "Return JSON array, one item per slot:\n"
+        '[{"slot_index": 1, "query": "...", "alternative_queries": ["...", "..."]}, ...]'
+    )
+
+    t0 = time.time()
+    logger.info("BrollScan: запрос stock-запросов к Gemini...")
+    response = client.models.generate_content(
+        model=model,
+        contents=[prompt],
+        config={"response_mime_type": "application/json"},
+    )
+    logger.info("BrollScan: Gemini %.1f сек", time.time() - t0)
+
+    try:
+        queries = json.loads(response.text)
+        if not isinstance(queries, list):
+            queries = []
+    except (json.JSONDecodeError, TypeError):
+        queries = []
+
+    # Merge slots + queries
+    query_map = {q.get("slot_index", i + 1): q for i, q in enumerate(queries)}
+    result = []
+    for i, slot in enumerate(slots):
+        q = query_map.get(i + 1, {})
+        result.append({
+            "start": slot["start"],
+            "end": slot["end"],
+            "duration": round(slot["end"] - slot["start"], 1),
+            "context_text": slot["context_text"],
+            "query": q.get("query", slot["context_text"][:60]),
+            "alternative_queries": q.get("alternative_queries", []),
+        })
+
+    logger.info("BrollScan: %d предложений готово", len(result))
+    return result

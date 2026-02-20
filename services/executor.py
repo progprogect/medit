@@ -205,7 +205,12 @@ def _temp_path(base: Path, prefix: str, suffix: str) -> Path:
     return base.parent / f"{prefix}_{abs(hash(str(time.time()))) % 100000}{suffix}"
 
 
-def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
+def run_tasks(
+    input_path: Path,
+    tasks: list[dict],
+    output_path: Path,
+    initial_registry: dict[str, Path] | None = None,
+) -> Path:
     """Execute list of tasks on video using a graph-based registry.
 
     Each task dict may contain:
@@ -223,6 +228,8 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
     temp_paths: list[Path] = []
     # Maps output_id -> Path. "source" always points to the original input.
     registry: dict[str, Path] = {"source": input_path}
+    if initial_registry:
+        registry.update(initial_registry)
     # Default linear chain pointer
     current_path: Path = input_path
     # Paths downloaded from stock (need audio stripping in concat)

@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from services.gemini import analyze_and_generate_plan, analyze_and_generate_tasks
+from services.gemini import analyze_and_generate_plan, analyze_and_generate_tasks, scan_broll_suggestions
 from services.executor import run_tasks
 from services.storage import get_storage
 
@@ -124,6 +124,107 @@ async def process(req: ProcessRequest):
             temp_path.unlink(missing_ok=True)
 
     output_key = await asyncio.to_thread(_process)
+
+    download_url = storage.get_download_url(output_key, is_output=True)
+    return ProcessResponse(output_key=output_key, download_url=download_url)
+
+
+class BrollScanRequest(BaseModel):
+    video_key: str
+    max_inserts: int = 3
+
+
+class BrollSlot(BaseModel):
+    start: float
+    end: float
+    duration: float
+    context_text: str
+    query: str
+    alternative_queries: list[str] = []
+    enabled: bool = True
+
+
+class BrollApplyRequest(BaseModel):
+    video_key: str
+    slots: list[BrollSlot]
+
+
+@app.post("/broll-scan")
+async def broll_scan(req: BrollScanRequest):
+    """Scan video and return B-roll insertion suggestions."""
+    storage = get_storage()
+    try:
+        input_path = storage.get_upload_path(req.video_key)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+
+    max_inserts = max(1, min(req.max_inserts, 6))
+
+    def _scan():
+        return scan_broll_suggestions(input_path, max_inserts=max_inserts)
+
+    suggestions = await asyncio.to_thread(_scan)
+    return {"suggestions": suggestions}
+
+
+@app.post("/broll-apply", response_model=ProcessResponse)
+async def broll_apply(req: BrollApplyRequest):
+    """Download stock clips and overlay them on the video."""
+    storage = get_storage()
+    try:
+        input_path = storage.get_upload_path(req.video_key)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+
+    enabled_slots = [s for s in req.slots if s.enabled]
+    if not enabled_slots:
+        raise HTTPException(400, "No enabled slots to apply")
+
+    def _apply():
+        from services.stock import fetch_stock_media
+        from services.executor import run_tasks
+
+        pre_registry: dict[str, Path] = {}
+        overlay_tasks: list[dict] = []
+        dest_dir = storage.output_dir
+
+        for i, slot in enumerate(enabled_slots):
+            oid = f"broll_{i + 1}"
+            media_path = fetch_stock_media(
+                query=slot.query,
+                media_type="video",
+                dest_dir=dest_dir,
+                duration_max=max(10, int(slot.duration) + 5),
+                orientation="landscape",
+                alternatives=slot.alternative_queries,
+            )
+            if media_path is None:
+                continue
+            pre_registry[oid] = media_path
+            overlay_tasks.append({
+                "type": "overlay_video",
+                "params": {
+                    "start_time": slot.start,
+                    "end_time": slot.end,
+                    "stock_id": oid,
+                },
+            })
+
+        if not overlay_tasks:
+            raise RuntimeError("No stock clips could be found for any slot")
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+            temp_path = Path(tf.name)
+        try:
+            run_tasks(input_path, overlay_tasks, temp_path, initial_registry=pre_registry)
+            return storage.save_output(None, temp_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    try:
+        output_key = await asyncio.to_thread(_apply)
+    except RuntimeError as e:
+        raise HTTPException(422, str(e))
 
     download_url = storage.get_download_url(output_key, is_output=True)
     return ProcessResponse(output_key=output_key, download_url=download_url)
