@@ -1,4 +1,10 @@
-"""Gemini API integration: video analysis and task generation."""
+"""Gemini API integration: video analysis and task generation.
+
+Architecture:
+  - Python (deterministic) controls B-roll STRUCTURE: how many, where, how long.
+  - Gemini (LLM) controls CONTENT: text overlays, stock clip descriptions.
+  - Validator enforces rules after plan generation.
+"""
 
 import json
 import logging
@@ -15,121 +21,46 @@ from schemas.tasks import PlanResponse
 
 logger = logging.getLogger(__name__)
 
-LONG_VIDEO_THRESHOLD_SEC = 120  # 2 minutes — меньше кадров для анализа
+LONG_VIDEO_THRESHOLD_SEC = 120
 
-SYSTEM_INSTRUCTION = """You are a professional video editor. You receive a video, its transcript with timestamps, and a user request. Your job: generate a smart, minimal, high-quality editing plan.
+# ─── B-roll rules (configurable) ─────────────────────────────────────────────
+BROLL_RULES = {
+    "max_inserts": 3,        # maximum B-roll inserts per video
+    "min_duration": 4.0,     # minimum insert duration (seconds)
+    "max_duration": 5.0,     # maximum insert duration (seconds)
+    "min_topic_sec": 5.0,    # speaker must discuss topic for at least this long
+    "avoid_first": 6.0,      # avoid B-roll in first N seconds
+    "avoid_last": 8.0,       # avoid B-roll in last N seconds
+    "min_gap": 10.0,         # minimum gap between two inserts
+}
 
-THINK BEFORE YOU PLAN (put your reasoning in scenario_description):
-1. What is happening in the video? What does the speaker say at each timestamp?
-2. What does the user want? What platform and audience?
-3. What would make this video genuinely good? (strong hook in 0-3s, clear message, CTA, right pacing)
-4. Which moments need B-roll? Pick only 2-4 specific moments where visuals enhance the speech.
-5. Would a senior editor approve this plan? Cut anything unnecessary.
+# ─── System instruction for Gemini (content only) ─────────────────────────────
+CONTENT_SYSTEM_INSTRUCTION = """You are a professional video editor. You receive:
+1. A video and its full transcript with timestamps.
+2. Pre-computed B-roll slots (exact timestamps where stock footage will be inserted).
+3. A user request.
 
-TASK ORDER — always follow this sequence:
-  [structural] → [text overlays] → [fetch stock] → [overlay B-roll] → [polish]
+Your job: generate text overlays + stock clip descriptions. Do NOT change the B-roll positions — they are already decided.
+
+TASK ORDER — always follow this exact sequence:
   1. auto_frame_face (if vertical format needed)
-  2. trim (only if shortening the video)
-  3. add_text_overlay (text synced to transcript timestamps)
-  4. fetch_stock_video (download each B-roll clip, give descriptive output_id)
-  5. overlay_video (place each B-roll at the right timestamp)
-  6. color_correction / add_subtitles (final polish)
+  2. trim (only if shortening)
+  3. add_text_overlay (key phrases, synced to transcript; 4-8 overlays total)
+  4. fetch_stock_video (one per B-roll slot, with specific visual query)
+  5. overlay_video (one per B-roll slot, using the pre-decided timestamps)
+  6. color_correction (optional final polish)
 
-CRITICAL RULES:
-- NEVER generate a task with empty params {}.
+RULES:
 - add_text_overlay params: text, position, font_size, font_color, shadow, background, start_time, end_time ONLY.
-- fetch_stock_video params: query, alternative_queries, duration_max, orientation ONLY.
+- fetch_stock_video params: query, alternative_queries, duration_max, orientation ONLY. MUST have output_id.
 - overlay_video params: start_time, end_time, stock_id ONLY.
-- Do NOT add arbitrary params from other task types into the wrong task.
+- Text overlays: strong hook in first 3s, key points synced to speech, CTA near end.
+- Stock queries: describe a SPECIFIC visual scene (e.g. "man typing on laptop close-up screen" not "business").
+- Do NOT generate more fetch_stock_video / overlay_video tasks than the pre-computed slots.
 
-GRAPH TASKS: Tasks support optional fields:
-  - "output_id": string — name this task's output for use by later tasks via "inputs"
-  - "inputs": [string, ...] — use named outputs of previous tasks as input instead of the linear chain
+NEVER mix params between task types. Generate ONLY valid JSON. No markdown."""
 
-Special registry key: "source" always refers to the ORIGINAL uploaded video.
-
-Use output_id + inputs when you need to:
-  1. Cut multiple segments from the original video to later concat them.
-  2. Mix original video segments with stock B-roll.
-In these cases EVERY trim that cuts from the original MUST use inputs: ["source"] and have an output_id.
-fetch_stock_* tasks MUST have an output_id and are automatically placed in the registry (they do NOT change the current chain).
-Simple linear tasks (single add_text_overlay, resize, etc.) do NOT need output_id or inputs.
-
-Task types with required params — use EXACTLY these formats:
-
-add_text_overlay — required: text, font_size, font_color; position OR (x, y); optional: start_time, end_time, margin, shadow, background, border_color, border_width
-  position values: top_center, bottom_center, top_left, top_right, bottom_left, bottom_right, center
-  x, y values: integer pixels, "50%" percentage, or FFmpeg expression like "(w-text_w)/2"
-  margin: pixels from edge when using position (default 50)
-  shadow: true/false — drop shadow for readability
-  background: "dark" (black@0.55), "light" (white@0.55), "none", or custom "black@0.7"
-  border_color + border_width: text outline (e.g. "black", 2)
-  STYLE GUIDE: For reels/ads use shadow=true + background="dark" for key titles. Use border_color="black"+border_width=2 for subtle outlines. Avoid plain white text on bright backgrounds.
-  Examples:
-    {"type": "add_text_overlay", "params": {"text": "B2B лидогенерация", "position": "bottom_center", "font_size": 56, "font_color": "white", "shadow": true, "background": "dark", "start_time": 0.0, "end_time": 4.0}}
-    {"type": "add_text_overlay", "params": {"text": "Привет!", "x": "(w-text_w)/2", "y": "h*0.15", "font_size": 64, "font_color": "#FFD700", "border_color": "black", "border_width": 3, "start_time": 0.0, "end_time": 2.0}}
-
-trim — required: start, end (seconds).
-  If cutting from original for concat: use inputs: ["source"] and set output_id.
-  Example single trim: {"type": "trim", "params": {"start": 5.0, "end": 45.0}}
-  Example for concat: {"type": "trim", "params": {"start": 5.0, "end": 20.0}, "inputs": ["source"], "output_id": "clip_a"}
-  Example with stock: {"type": "trim", "params": {"start": 20.0, "end": 40.0}, "inputs": ["source"], "output_id": "clip_b"}
-
-resize — required: width; optional: height
-  Example: {"type": "resize", "params": {"width": 1080, "height": 1920}}
-
-change_speed — required: factor
-  Example: {"type": "change_speed", "params": {"factor": 1.25}}
-
-add_subtitles — required: segments (use timestamps from the transcript)
-  Example: {"type": "add_subtitles", "params": {"segments": [{"start": 0.0, "end": 3.5, "text": "Привет, я Никита"}]}}
-
-auto_frame_face — required: target_ratio
-  Example: {"type": "auto_frame_face", "params": {"target_ratio": "9:16"}}
-
-color_correction — at least one of: brightness, contrast, saturation (-1..1)
-  Example: {"type": "color_correction", "params": {"brightness": 0.05, "contrast": 0.1}}
-
-zoompan — required: zoom, duration
-  Example: {"type": "zoompan", "params": {"zoom": 1.2, "duration": 3.0}}
-
-concat — preferred: use "inputs" with output_ids; fallback: clip_paths array
-  Example with graph: {"type": "concat", "params": {}, "inputs": ["clip_a", "broll_1", "clip_b"]}
-  Example legacy: {"type": "concat", "params": {"clip_paths": ["/path/a.mp4"]}}
-  Full B-roll example (trim source + fetch stock + concat):
-    {"type": "trim", "params": {"start": 0, "end": 15}, "inputs": ["source"], "output_id": "clip_a"}
-    {"type": "fetch_stock_video", "params": {"query": "business meeting", "duration_max": 8}, "output_id": "broll_1"}
-    {"type": "trim", "params": {"start": 15, "end": 30}, "inputs": ["source"], "output_id": "clip_b"}
-    {"type": "concat", "params": {}, "inputs": ["clip_a", "broll_1", "clip_b"]}
-
-EXAMPLE PLAN for "make a vertical promo ad with B-roll":
-[
-  {"type": "auto_frame_face", "params": {"target_ratio": "9:16"}},
-  {"type": "add_text_overlay", "params": {"text": "Привет! Я Никита", "position": "bottom_center", "font_size": 60, "font_color": "white", "shadow": true, "background": "dark", "start_time": 0.5, "end_time": 2.5}},
-  {"type": "add_text_overlay", "params": {"text": "Помогаю B2B настраивать лидогенерацию", "position": "bottom_center", "font_size": 44, "font_color": "white", "shadow": true, "start_time": 2.1, "end_time": 7.0}},
-  {"type": "add_text_overlay", "params": {"text": "Запишитесь на консультацию ↓", "position": "center", "font_size": 56, "font_color": "#FFD700", "shadow": true, "background": "dark", "start_time": 54.0, "end_time": 58.0}},
-  {"type": "fetch_stock_video", "params": {"query": "man configuring email automation on laptop close-up screen", "alternative_queries": ["email marketing software setup", "business email dashboard"], "duration_max": 8, "orientation": "portrait"}, "output_id": "broll_email"},
-  {"type": "fetch_stock_video", "params": {"query": "businesswoman scrolling contacts list on smartphone", "alternative_queries": ["sales prospecting phone", "business contacts search"], "duration_max": 8, "orientation": "portrait"}, "output_id": "broll_contacts"},
-  {"type": "overlay_video", "params": {"start_time": 19.7, "end_time": 23.6, "stock_id": "broll_email"}},
-  {"type": "overlay_video", "params": {"start_time": 30.8, "end_time": 34.8, "stock_id": "broll_contacts"}},
-  {"type": "color_correction", "params": {"brightness": 0.05, "contrast": 0.1, "saturation": 0.1}}
-]
-
-TASK PARAMS — use ONLY the listed params for each task type:
-- add_text_overlay: text, position, font_size, font_color, shadow, background, border_color, border_width, start_time, end_time
-- trim: start, end
-- resize: width, height
-- auto_frame_face: target_ratio
-- color_correction: brightness, contrast, saturation
-- add_subtitles: segments (array of {start, end, text})
-- fetch_stock_video: query, alternative_queries, duration_max, orientation  [MUST have output_id field]
-- fetch_stock_image: query, alternative_queries, orientation  [MUST have output_id field]
-- overlay_video: start_time, end_time, stock_id  [stock_id = output_id of a fetch_stock_video]
-- zoompan: zoom, duration
-- concat: use inputs field with output_id references
-
-DO NOT mix params between task types. Generate ONLY valid JSON. No markdown. Tasks execute in order."""
-
+# ─── Gemini JSON schema ────────────────────────────────────────────────────────
 PLAN_JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -178,15 +109,6 @@ PLAN_JSON_SCHEMA = {
                                     "required": ["start", "end", "text"],
                                 },
                             },
-                            # add_text_overlay extra styling
-                            "margin": {"type": "integer"},
-                            "x": {},
-                            "y": {},
-                            "shadow": {"type": "boolean"},
-                            "background": {"type": "string"},
-                            "border_color": {"type": "string"},
-                            "border_width": {"type": "integer"},
-                            # add_image_overlay
                             "image_path": {"type": "string"},
                             "opacity": {"type": "number"},
                             "target_ratio": {"type": "string"},
@@ -196,12 +118,18 @@ PLAN_JSON_SCHEMA = {
                             "clip_paths": {"type": "array", "items": {"type": "string"}},
                             "zoom": {"type": "number"},
                             "duration": {"type": "number"},
-                            # fetch_stock_* / overlay_video
                             "query": {"type": "string"},
                             "alternative_queries": {"type": "array", "items": {"type": "string"}},
                             "duration_max": {"type": "integer"},
                             "orientation": {"type": "string"},
                             "stock_id": {"type": "string"},
+                            "shadow": {"type": "boolean"},
+                            "background": {"type": "string"},
+                            "border_color": {"type": "string"},
+                            "border_width": {"type": "integer"},
+                            "margin": {"type": "integer"},
+                            "x": {},
+                            "y": {},
                         },
                     },
                 },
@@ -213,61 +141,186 @@ PLAN_JSON_SCHEMA = {
 }
 
 
-def detect_burned_subtitles(video_path: Path) -> bool:
-    """Check if video has burned-in (hardcoded) subtitles by sampling frames with Gemini Vision."""
-    api_key = get_gemini_api_key()
-    client = genai.Client(api_key=api_key)
+# ═══════════════════════════════════════════════════════════════════════════════
+# DETERMINISTIC: Python controls B-roll structure
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # Extract 4 frames evenly spaced through the video
+def find_broll_slots(
+    segments: list[dict],
+    video_duration: float,
+    rules: dict | None = None,
+) -> list[dict]:
+    """Compute optimal B-roll insertion points deterministically from transcript.
+
+    Strategy:
+    - Split valid range into equal sections (one per allowed insert).
+    - In each section, snap to the nearest sentence boundary.
+    - Return {start, end, context_text} for each slot.
+    """
+    rules = rules or BROLL_RULES
+    max_n = rules["max_inserts"]
+    target_dur = (rules["min_duration"] + rules["max_duration"]) / 2
+    avoid_start = rules["avoid_first"]
+    avoid_end = video_duration - rules["avoid_last"]
+    min_gap = rules["min_gap"]
+
+    valid_start = avoid_start
+    valid_end = avoid_end - target_dur
+
+    if valid_end <= valid_start or not segments:
+        return []
+
+    # Divide valid range into max_n sections and find one slot per section
+    section_len = (valid_end - valid_start) / max_n
+    slots: list[dict] = []
+
+    for i in range(max_n):
+        section_start = valid_start + i * section_len
+        section_end = section_start + section_len
+
+        # Find segment boundaries within this section
+        boundaries = [
+            s["end"] for s in segments
+            if section_start <= s["end"] <= section_end
+        ]
+
+        if boundaries:
+            # Pick the boundary closest to the middle of the section
+            mid = (section_start + section_end) / 2
+            snap = min(boundaries, key=lambda b: abs(b - mid))
+        else:
+            snap = (section_start + section_end) / 2
+
+        insert_start = round(snap, 1)
+        insert_end = round(insert_start + target_dur, 1)
+
+        # Avoid overlap with previous slot
+        if slots and insert_start < slots[-1]["end"] + min_gap:
+            insert_start = round(slots[-1]["end"] + min_gap, 1)
+            insert_end = round(insert_start + target_dur, 1)
+
+        if insert_end > avoid_end:
+            break
+
+        # Gather transcript context around this slot for stock query generation
+        context_segs = [
+            s for s in segments
+            if s["start"] >= insert_start - 3 and s["end"] <= insert_end + 5
+        ]
+        context_text = " ".join(s["text"] for s in context_segs).strip()[:300]
+
+        slots.append({
+            "start": insert_start,
+            "end": insert_end,
+            "context_text": context_text,
+        })
+
+    logger.info("B-roll slots: %s", [(s["start"], s["end"]) for s in slots])
+    return slots
+
+
+def validate_and_fix_plan(tasks: list[dict], rules: dict | None = None) -> list[dict]:
+    """Post-process plan to enforce B-roll rules deterministically.
+
+    Enforces:
+    - fetch_stock_video has output_id
+    - overlay_video has correct duration (min/max)
+    - Number of overlays does not exceed max_inserts
+    - Fetch tasks without matching overlay are removed
+    """
+    rules = rules or BROLL_RULES
+
+    # Ensure all fetch_stock tasks have output_ids
+    stock_counter = 0
+    for task in tasks:
+        if task["type"] in ("fetch_stock_video", "fetch_stock_image") and not task.get("output_id"):
+            stock_counter += 1
+            task["output_id"] = f"stock_{stock_counter}"
+
+    # Fix overlay durations
+    for task in tasks:
+        if task["type"] != "overlay_video":
+            continue
+        p = task["params"]
+        start = p.get("start_time", 0)
+        end = p.get("end_time", start + rules["min_duration"])
+        dur = end - start
+        if dur < rules["min_duration"]:
+            p["end_time"] = round(start + rules["min_duration"], 1)
+        elif dur > rules["max_duration"]:
+            p["end_time"] = round(start + rules["max_duration"], 1)
+
+    # Limit number of overlays to max_inserts
+    overlay_indices = [i for i, t in enumerate(tasks) if t["type"] == "overlay_video"]
+    if len(overlay_indices) > rules["max_inserts"]:
+        excess_indices = set(overlay_indices[rules["max_inserts"]:])
+        # Find stock_ids used by excess overlays
+        excess_stock_ids = {tasks[i]["params"].get("stock_id") for i in excess_indices}
+        # Remove excess overlays and their fetch tasks
+        tasks = [
+            t for j, t in enumerate(tasks)
+            if j not in excess_indices
+            and not (t["type"] == "fetch_stock_video" and t.get("output_id") in excess_stock_ids)
+        ]
+        logger.info("Validator: обрезано до %d B-roll вставок", rules["max_inserts"])
+
+    logger.info("Validator: итого задач %d, overlay %d",
+                len(tasks), sum(1 for t in tasks if t["type"] == "overlay_video"))
+    return tasks
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Gemini utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_burned_subtitles(video_path: Path) -> bool:
+    """Check if video has burned-in subtitles by sampling frames with Gemini Vision."""
     duration = _get_video_duration(video_path)
     if duration <= 0:
         return False
 
-    frame_times = [duration * t for t in (0.1, 0.33, 0.66, 0.9)]
+    frame_times = [duration * t for t in (0.15, 0.5, 0.85)]
     frame_parts = []
     with tempfile.TemporaryDirectory() as tmpdir:
         for idx, ts in enumerate(frame_times):
             frame_path = Path(tmpdir) / f"frame_{idx}.jpg"
-            result = subprocess.run(
+            r = subprocess.run(
                 ["ffmpeg", "-y", "-ss", str(ts), "-i", str(video_path),
                  "-vframes", "1", "-q:v", "3", str(frame_path)],
                 capture_output=True,
             )
-            if result.returncode == 0 and frame_path.exists():
-                frame_data = frame_path.read_bytes()
+            if r.returncode == 0 and frame_path.exists():
                 frame_parts.append(
-                    types.Part.from_bytes(data=frame_data, mime_type="image/jpeg")
+                    types.Part.from_bytes(data=frame_path.read_bytes(), mime_type="image/jpeg")
                 )
 
     if not frame_parts:
         return False
 
-    prompt = (
-        "Look at these video frames. Do you see any burned-in (hardcoded) subtitles or captions "
-        "as text overlaid on the video picture itself (not UI elements, not titles, "
-        "but subtitle text at the bottom or sides of the frame)? "
-        "Answer with a single word: YES or NO."
-    )
     try:
+        api_key = get_gemini_api_key()
+        client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=[*frame_parts, prompt],
+            contents=[
+                *frame_parts,
+                "Do you see burned-in subtitles overlaid on the video frames? Answer YES or NO.",
+            ],
         )
         answer = (response.text or "").strip().upper()
-        result = "YES" in answer
-        logger.info("detect_burned_subtitles: ответ Gemini='%s' → %s", answer, result)
-        return result
+        result_val = "YES" in answer
+        logger.info("detect_burned_subtitles: %s → %s", answer, result_val)
+        return result_val
     except Exception as e:
         logger.warning("detect_burned_subtitles: ошибка %s, считаем False", e)
         return False
 
 
 def _get_video_duration(video_path: Path) -> float:
-    """Get video duration in seconds via ffprobe."""
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
-        capture_output=True,
-        text=True,
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+        capture_output=True, text=True,
     )
     if result.returncode != 0:
         return 0.0
@@ -277,195 +330,78 @@ def _get_video_duration(video_path: Path) -> float:
         return 0.0
 
 
-def _repair_broll_plan(tasks: list[dict]) -> list[dict]:
-    """
-    Fix B-roll plans where Gemini forgets output_ids and concat inputs.
-
-    Rules:
-    - fetch_stock_video → assign output_id, add to concat sequence (video only!)
-    - fetch_stock_image → assign output_id, do NOT add to concat (images go as overlays)
-    - trim tasks in B-roll plan → force inputs=['source'], assign output_id, add to concat sequence
-    - concat → fill inputs from sequence in plan order
-    - post-processing tasks (add_text_overlay, color_correction, resize, etc.) stay AFTER concat
-    """
-    has_fetch_video = any(t["type"] == "fetch_stock_video" for t in tasks)
-    if not has_fetch_video:
-        return tasks
-
-    # If plan already has overlay_video tasks with stock_id → Gemini did it correctly, don't touch
-    has_overlay = any(
-        t["type"] == "overlay_video" and t.get("params", {}).get("stock_id")
-        for t in tasks
-    )
-    if has_overlay:
-        # Just ensure all fetch_stock tasks have output_ids
-        for i, task in enumerate(tasks):
-            if task["type"] in ("fetch_stock_video", "fetch_stock_image") and not task.get("output_id"):
-                tasks[i] = dict(task)
-                tasks[i]["output_id"] = f"stock_{i}"
-        logger.info("Repair: план уже использует overlay_video, только проверяем output_ids")
-        return tasks
-
-    ASSEMBLY_TYPES = {"trim", "fetch_stock_video", "fetch_stock_image"}
-    POST_TYPES = {"add_text_overlay", "add_subtitles", "color_correction", "zoompan",
-                  "add_image_overlay", "resize", "auto_frame_face", "change_speed"}
-
-    assembly: list[dict] = []
-    post_processing: list[dict] = []
-    concat_task: dict | None = None
-
-    stock_counter = 0
-    clip_counter = 0
-    sequence: list[str] = []  # concat sequence (video clips only)
-
-    for task in tasks:
-        task = dict(task)
-        t_type = task["type"]
-
-        if t_type == "fetch_stock_video":
-            if not task.get("output_id"):
-                stock_counter += 1
-                task["output_id"] = f"stock_{stock_counter}"
-                logger.info("Repair: auto output_id='%s' для fetch_stock_video", task["output_id"])
-            sequence.append(task["output_id"])
-            assembly.append(task)
-
-        elif t_type == "fetch_stock_image":
-            if not task.get("output_id"):
-                stock_counter += 1
-                task["output_id"] = f"stock_img_{stock_counter}"
-                logger.info("Repair: auto output_id='%s' для fetch_stock_image", task["output_id"])
-            # Images go to assembly but NOT to sequence (can't concat video+image)
-            assembly.append(task)
-
-        elif t_type == "trim":
-            # Force all trims in a B-roll plan to read from original source
-            if not task.get("inputs"):
-                task["inputs"] = ["source"]
-            if not task.get("output_id"):
-                clip_counter += 1
-                task["output_id"] = f"clip_{clip_counter}"
-                logger.info("Repair: auto output_id='%s', inputs=['source'] для trim", task["output_id"])
-            sequence.append(task["output_id"])
-            assembly.append(task)
-
-        elif t_type == "concat":
-            concat_task = task  # capture, will rebuild below
-
-        elif t_type in POST_TYPES:
-            post_processing.append(task)
-
-        # Other unknown types — keep in post_processing
-        else:
-            post_processing.append(task)
-
-    if not sequence:
-        return tasks  # nothing useful found
-
-    # --- Convert to overlay_video based B-roll (preserves original audio) ---
-    # Find trim sections and their gaps to determine overlay timestamps
-    trim_sections = sorted(
-        [(t.get("params", {}).get("start", 0), t.get("params", {}).get("end", 0),
-          t.get("output_id", ""))
-         for t in assembly if t["type"] == "trim"],
-        key=lambda x: x[0],
-    )
-    stock_video_ids = [s for s in sequence if s.startswith("stock_") and not s.startswith("stock_img_")]
-
-    # Find gaps between consecutive trim sections (these are where B-roll goes)
-    gaps: list[tuple[float, float]] = []
-    for i in range(len(trim_sections) - 1):
-        gap_start = trim_sections[i][1]
-        gap_end = trim_sections[i + 1][0]
-        if gap_end > gap_start + 0.5:  # only meaningful gaps
-            gaps.append((gap_start, gap_end))
-
-    if gaps and stock_video_ids:
-        # Build overlay-based plan: fetch stocks, then overlay them at gaps
-        fetch_tasks = [t for t in assembly if t["type"] in ("fetch_stock_video", "fetch_stock_image")]
-        trim_tasks_clean = [t for t in assembly if t["type"] == "trim"]
-
-        # Generate overlay tasks for each gap + stock pair
-        overlay_tasks: list[dict] = []
-        for i, (gap_start, gap_end) in enumerate(gaps):
-            if i >= len(stock_video_ids):
-                break
-            stock_id = stock_video_ids[i]
-            overlay_tasks.append({
-                "type": "overlay_video",
-                "params": {"start_time": gap_start, "end_time": gap_end, "stock_id": stock_id},
-            })
-
-        # Any extra stocks without gaps — add overlays after the last trim
-        if trim_sections:
-            last_end = trim_sections[-1][1]
-            for j in range(len(gaps), min(len(stock_video_ids), len(gaps) + 3)):
-                stock_id = stock_video_ids[j]
-                overlay_tasks.append({
-                    "type": "overlay_video",
-                    "params": {"start_time": last_end, "end_time": last_end + 8, "stock_id": stock_id},
-                })
-                last_end += 8
-
-        logger.info("Repair: overlay plan — %d overlays: %s",
-                    len(overlay_tasks), [(t["params"]["start_time"], t["params"]["end_time"]) for t in overlay_tasks])
-
-        # Plan: fetch stocks → overlay them (no concat needed) → post-processing
-        repaired = fetch_tasks + overlay_tasks + post_processing
-        return repaired
-
-    # Fallback: not enough info for overlay → use concat with proper interleaving
-    clip_ids = [s for s in sequence if s.startswith("clip_")]
-    stock_ids = [s for s in sequence if s.startswith("stock_") and not s.startswith("stock_img_")]
-    interleaved: list[str] = []
-    for i, clip_id in enumerate(clip_ids):
-        interleaved.append(clip_id)
-        if i < len(stock_ids):
-            interleaved.append(stock_ids[i])
-    interleaved.extend(stock_ids[len(clip_ids):])
-    if not interleaved:
-        interleaved = sequence
-
-    if concat_task is None:
-        concat_task = {"type": "concat", "params": {}}
-    concat_task["inputs"] = interleaved
-    concat_task["params"] = {}
-    logger.info("Repair: concat fallback inputs = %s", interleaved)
-
-    repaired = assembly + [concat_task] + post_processing
-    return repaired
+def _parse_time(v) -> float | None:
+    """Parse timestamp: float → float, '01:23' → 83.0, None → None."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            if len(parts) == 2:
+                return float(parts[0]) * 60 + float(parts[1])
+            elif len(parts) == 3:
+                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        except ValueError:
+            pass
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
-def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
-    """
-    Analyze video with Gemini and generate editing plan (scenario + metadata + tasks).
-    For long videos: transcribe audio first, then send transcript + low-FPS video.
-    Returns dict: {scenario_name, scenario_description, metadata, tasks}.
-    """
-    from services.transcriber import transcribe
+def _normalize_task(task: dict) -> dict:
+    """Normalize a single task dict from Gemini's free-form output."""
+    # Normalize key: type might be 'task_type', 'action', 'step', etc.
+    for key in ("task_type", "action", "step", "operation"):
+        if key in task and "type" not in task:
+            task["type"] = task.pop(key)
+            break
 
-    api_key = get_gemini_api_key()
-    client = genai.Client(api_key=api_key)
+    # Normalize output_id / id
+    if "id" in task and "output_id" not in task:
+        task["output_id"] = task.pop("id")
 
-    duration_sec = _get_video_duration(video_path)
+    params = task.get("params", task.get("parameters", task.get("config", {})))
+    if not isinstance(params, dict):
+        params = {}
+    task["params"] = params
+
+    # Normalize timestamp strings in params
+    for key in ("start_time", "end_time", "start", "end"):
+        if key in params:
+            parsed = _parse_time(params[key])
+            if parsed is not None:
+                params[key] = parsed
+
+    return task
+
+
+def _normalize_gemini_response(data: dict) -> dict:
+    """Normalize Gemini's free-form JSON to match PlanResponse schema."""
+    # Normalize tasks list key
+    tasks_raw = data.get("tasks", data.get("task_list", data.get("steps", [])))
+    if not isinstance(tasks_raw, list):
+        tasks_raw = []
+    data["tasks"] = [_normalize_task(t) for t in tasks_raw if isinstance(t, dict)]
+
+    # Ensure required top-level fields
+    if "scenario_name" not in data:
+        data["scenario_name"] = data.get("name", data.get("title", "Video Plan"))
+    if "scenario_description" not in data:
+        data["scenario_description"] = data.get("description", data.get("summary", ""))
+    if "metadata" not in data:
+        data["metadata"] = {}
+
+    return data
+
+
+def _upload_video(client, video_path: Path, is_long: bool) -> types.Part:
+    """Upload video to Files API or inline."""
     file_size_mb = video_path.stat().st_size / (1024 * 1024)
-    use_files_api = file_size_mb > 20
-    is_long = duration_sec > LONG_VIDEO_THRESHOLD_SEC
-
-    transcript_text = ""
-    transcript_segments: list[dict] = []
-
-    t0 = time.time()
-    logger.info("Gemini: транскрипция Whisper (%.0f сек видео)...", duration_sec)
-    transcript_text, transcript_segments, _ = transcribe(video_path)
-    logger.info("Gemini: транскрипция заняла %.1f сек", time.time() - t0)
-
-    t0 = time.time()
-    logger.info("Gemini: проверка наличия burned-in субтитров...")
-    has_burned_subs = detect_burned_subtitles(video_path)
-    logger.info("Gemini: burned-in субтитры = %s (%.1f сек)", has_burned_subs, time.time() - t0)
-
-    if use_files_api:
+    if file_size_mb > 20:
         t0 = time.time()
         logger.info("Gemini: загрузка видео в Files API...")
         uploaded = client.files.upload(file=str(video_path))
@@ -477,63 +413,122 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
                 logger.info("Gemini: файл готов за %.1f сек (state=%s)", time.time() - t0, state)
                 break
             if i % 5 == 0 and i > 0:
-                logger.info("Gemini: ожидание обработки... %ds (state=%s)", i * 2, state)
+                logger.info("Gemini: ожидание... %ds (state=%s)", i * 2, state)
             time.sleep(2)
         fps = 0.1 if is_long else 0.5
-        video_meta = types.VideoMetadata(fps=fps)
-        video_part = types.Part(
+        return types.Part(
             file_data=types.FileData(file_uri=uploaded.uri, mime_type=uploaded.mime_type),
-            video_metadata=video_meta,
+            video_metadata=types.VideoMetadata(fps=fps),
         )
     else:
-        video_bytes = video_path.read_bytes()
-        video_part = types.Part.from_bytes(data=video_bytes, mime_type="video/mp4")
+        return types.Part.from_bytes(data=video_path.read_bytes(), mime_type="video/mp4")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def analyze_and_generate_plan(
+    video_path: Path,
+    user_prompt: str,
+    model: str = "gemini-2.5-flash",
+    broll_rules: dict | None = None,
+) -> dict:
+    """Generate editing plan using hybrid architecture.
+
+    Flow:
+    1. Transcribe audio (Whisper).
+    2. Detect burned-in subtitles (Gemini Vision).
+    3. Compute B-roll slots deterministically from transcript (Python).
+    4. Upload video, call Gemini with pre-computed slots as constraints.
+    5. Validate and fix plan (Python).
+    """
+    from services.transcriber import transcribe
+
+    rules = broll_rules or BROLL_RULES
+    api_key = get_gemini_api_key()
+    client = genai.Client(api_key=api_key)
+
+    duration_sec = _get_video_duration(video_path)
+    is_long = duration_sec > LONG_VIDEO_THRESHOLD_SEC
+
+    # Step 1: Transcribe
+    t0 = time.time()
+    logger.info("Gemini: транскрипция Whisper (%.0f сек)...", duration_sec)
+    transcript_text, transcript_segments, _ = transcribe(video_path)
+    logger.info("Gemini: транскрипция %.1f сек", time.time() - t0)
+
+    # Step 2: Detect burned subtitles
+    t0 = time.time()
+    has_burned_subs = detect_burned_subtitles(video_path)
+    logger.info("Gemini: burned-in субтитры = %s (%.1f сек)", has_burned_subs, time.time() - t0)
+
+    # Step 3: Compute B-roll slots (Python, deterministic)
+    broll_slots = find_broll_slots(transcript_segments, duration_sec, rules)
+
+    # Step 4: Upload video and generate plan
+    video_part = _upload_video(client, video_path, is_long)
+
+    # Build prompt with pre-computed B-roll positions as constraints
+    slots_json = json.dumps(broll_slots, ensure_ascii=False, indent=2)
+    broll_constraint = ""
+    if broll_slots:
+        broll_constraint = (
+            f"\n\nPRE-COMPUTED B-ROLL SLOTS (DO NOT CHANGE THESE TIMESTAMPS):\n{slots_json}\n"
+            f"Generate exactly {len(broll_slots)} fetch_stock_video + overlay_video task pairs, "
+            f"using these exact start_time/end_time values. Use context_text to decide the stock query.\n"
+        )
 
     segments_for_prompt = transcript_segments[:200] if transcript_segments else []
     transcript_block = (
-        f"VIDEO TRANSCRIPT (use timestamps for all time-based params):\n---\n{transcript_text[:15000]}\n---\n"
-        f"Segments with exact timestamps: {json.dumps(segments_for_prompt)}\n\n"
+        f"VIDEO TRANSCRIPT:\n---\n{transcript_text[:15000]}\n---\n"
+        f"Segments with timestamps: {json.dumps(segments_for_prompt)}\n"
         if transcript_text else ""
     )
 
-    burned_subs_note = (
-        "NOTE: This video already has burned-in (hardcoded) subtitles visible on the frames. "
-        "Do NOT add an add_subtitles task.\n\n"
+    burned_note = (
+        "NOTE: Video has burned-in subtitles — do NOT add add_subtitles task.\n"
         if has_burned_subs else ""
     )
 
-    prompt_parts = [
+    prompt = "".join([
         transcript_block,
-        burned_subs_note,
-        f"User request: {user_prompt}\n\n"
-        "Return JSON with scenario_name, scenario_description, metadata (e.g. YouTube timestamps), and tasks array. "
-        "EVERY task must have fully filled params — never empty {}.",
-    ]
-
-    prompt = "".join(p for p in prompt_parts if p)
+        broll_constraint,
+        burned_note,
+        f"\nUser request: {user_prompt}\n\n"
+        "Return JSON: scenario_name, scenario_description, metadata, tasks. "
+        "EVERY task must have fully filled params.",
+    ])
 
     t_gen = time.time()
-    logger.info("Gemini: вызов generate_content...")
+    logger.info("Gemini: вызов generate_content (model=%s)...", model)
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=model,
         contents=[video_part, prompt],
         config={
-            "system_instruction": SYSTEM_INSTRUCTION,
+            "system_instruction": CONTENT_SYSTEM_INSTRUCTION,
             "response_mime_type": "application/json",
-            "response_schema": PLAN_JSON_SCHEMA,
         },
     )
+    logger.info("Gemini: generate_content %.1f сек", time.time() - t_gen)
 
-    logger.info("Gemini: generate_content занял %.1f сек", time.time() - t_gen)
     if not response.text:
         raise ValueError("Empty response from Gemini")
 
-    data = json.loads(response.text)
+    try:
+        data = json.loads(response.text)
+    except json.JSONDecodeError as e:
+        logger.error("Gemini: JSON parse error: %s\nResponse: %s", e, response.text[:500])
+        raise ValueError(f"Cannot parse Gemini response as JSON: {e}")
+
+    # Normalize response: Gemini sometimes uses task_type/action/step instead of type,
+    # and string timestamps instead of floats.
+    data = _normalize_gemini_response(data)
     validated = PlanResponse.model_validate(data)
+
     tasks = []
     for t in validated.tasks:
         if not t.params and t.inputs is None:
-            logger.warning("Gemini: задача %s вернула пустые params и нет inputs, пропускаем", t.type)
             continue
         task_dict: dict = {"type": t.type, "params": t.params}
         if t.output_id is not None:
@@ -541,10 +536,10 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
         if t.inputs is not None:
             task_dict["inputs"] = t.inputs
         tasks.append(task_dict)
-    if not tasks:
-        logger.warning("Gemini: все задачи имели пустые params — возможно, нужно переформулировать промпт")
 
-    tasks = _repair_broll_plan(tasks)
+    # Step 5: Validate and fix (Python, deterministic)
+    tasks = validate_and_fix_plan(tasks, rules)
+
     return {
         "scenario_name": validated.scenario_name,
         "scenario_description": validated.scenario_description,
@@ -554,8 +549,6 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
 
 
 def analyze_and_generate_tasks(video_path: Path, user_prompt: str) -> list[dict]:
-    """
-    Legacy: analyze and return tasks only (for backward compatibility).
-    """
+    """Legacy: analyze and return tasks only."""
     plan = analyze_and_generate_plan(video_path, user_prompt)
     return plan["tasks"]
