@@ -302,8 +302,9 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
     validated = PlanResponse.model_validate(data)
     tasks = []
     for t in validated.tasks:
-        if not t.params:
-            logger.warning("Gemini: задача %s вернула пустые params, пропускаем", t.type)
+        # params может быть {} для concat с inputs — это валидно
+        if not t.params and t.inputs is None:
+            logger.warning("Gemini: задача %s вернула пустые params и нет inputs, пропускаем", t.type)
             continue
         task_dict: dict = {"type": t.type, "params": t.params}
         if t.output_id is not None:

@@ -81,14 +81,16 @@ def _fetch_video(
         return None
 
     video = videos[0]
-    # Prefer SD/HD file to keep size manageable
     files = sorted(video.get("video_files", []), key=lambda f: f.get("width", 0))
+    if not files:
+        logger.warning("Stock: видео '%s' не имеет video_files", query)
+        return None
+    # Prefer SD/HD file to keep size manageable
+    video_url = files[-1]["link"]
     for f in files:
         if f.get("width", 0) <= 1920:
             video_url = f["link"]
             break
-    else:
-        video_url = files[-1]["link"]
 
     slug = query.replace(" ", "_")[:30]
     dest = dest_dir / f"stock_video_{slug}_{int(time.time())}.mp4"
