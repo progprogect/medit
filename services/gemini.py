@@ -145,18 +145,58 @@ PLAN_JSON_SCHEMA = {
 # DETERMINISTIC: Python controls B-roll structure
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _validate_and_fix_slots(
+    raw_slots: list[dict],
+    video_duration: float,
+    rules: dict,
+) -> list[dict]:
+    """Validate and fix B-roll slots from LLM output.
+    Enforces: valid range, min duration, max duration, min gap between slots.
+    """
+    target_dur = (rules["min_duration"] + rules["max_duration"]) / 2
+    avoid_end = video_duration - rules["avoid_last"]
+    valid_slots = []
+
+    for slot in sorted(raw_slots, key=lambda s: s["start"]):
+        start = slot["start"]
+        end = slot.get("end") or round(start + target_dur, 1)
+
+        # Enforce valid range
+        start = max(start, rules["avoid_first"])
+        end = min(end, avoid_end)
+
+        # Enforce duration bounds
+        dur = end - start
+        if dur < rules["min_duration"]:
+            end = round(start + rules["min_duration"], 1)
+        elif dur > rules["max_duration"]:
+            end = round(start + rules["max_duration"], 1)
+
+        # Skip if out of range
+        if start >= avoid_end or end > avoid_end:
+            continue
+
+        # Enforce minimum gap from previous slot
+        if valid_slots and start < valid_slots[-1]["end"] + rules["min_gap"]:
+            start = round(valid_slots[-1]["end"] + rules["min_gap"], 1)
+            end = round(start + target_dur, 1)
+            if end > avoid_end:
+                continue
+
+        slot = dict(slot)
+        slot["start"] = round(start, 1)
+        slot["end"] = round(end, 1)
+        valid_slots.append(slot)
+
+    return valid_slots[:rules["max_inserts"]]
+
+
 def find_broll_slots(
     segments: list[dict],
     video_duration: float,
     rules: dict | None = None,
 ) -> list[dict]:
-    """Compute optimal B-roll insertion points deterministically from transcript.
-
-    Strategy:
-    - Split valid range into equal sections (one per allowed insert).
-    - In each section, snap to the nearest sentence boundary.
-    - Return {start, end, context_text} for each slot.
-    """
+    """Deterministic fallback: equal-section split when semantic search fails."""
     rules = rules or BROLL_RULES
     max_n = rules["max_inserts"]
     target_dur = (rules["min_duration"] + rules["max_duration"]) / 2
@@ -166,57 +206,119 @@ def find_broll_slots(
 
     valid_start = avoid_start
     valid_end = avoid_end - target_dur
-
     if valid_end <= valid_start or not segments:
         return []
 
-    # Divide valid range into max_n sections and find one slot per section
     section_len = (valid_end - valid_start) / max_n
     slots: list[dict] = []
 
     for i in range(max_n):
         section_start = valid_start + i * section_len
         section_end = section_start + section_len
-
-        # Find segment boundaries within this section
-        boundaries = [
-            s["end"] for s in segments
-            if section_start <= s["end"] <= section_end
-        ]
-
-        if boundaries:
-            # Pick the boundary closest to the middle of the section
-            mid = (section_start + section_end) / 2
-            snap = min(boundaries, key=lambda b: abs(b - mid))
-        else:
-            snap = (section_start + section_end) / 2
+        boundaries = [s["end"] for s in segments if section_start <= s["end"] <= section_end]
+        mid = (section_start + section_end) / 2
+        snap = min(boundaries, key=lambda b: abs(b - mid)) if boundaries else mid
 
         insert_start = round(snap, 1)
         insert_end = round(insert_start + target_dur, 1)
 
-        # Avoid overlap with previous slot
         if slots and insert_start < slots[-1]["end"] + min_gap:
             insert_start = round(slots[-1]["end"] + min_gap, 1)
             insert_end = round(insert_start + target_dur, 1)
-
         if insert_end > avoid_end:
             break
 
-        # Gather transcript context around this slot for stock query generation
-        context_segs = [
-            s for s in segments
-            if s["start"] >= insert_start - 3 and s["end"] <= insert_end + 5
-        ]
+        context_segs = [s for s in segments if s["start"] >= insert_start - 3 and s["end"] <= insert_end + 5]
         context_text = " ".join(s["text"] for s in context_segs).strip()[:300]
+        slots.append({"start": insert_start, "end": insert_end, "context_text": context_text})
 
-        slots.append({
-            "start": insert_start,
-            "end": insert_end,
-            "context_text": context_text,
-        })
-
-    logger.info("B-roll slots: %s", [(s["start"], s["end"]) for s in slots])
+    logger.info("B-roll slots (fallback): %s", [(s["start"], s["end"]) for s in slots])
     return slots
+
+
+def find_broll_slots_semantic(
+    segments: list[dict],
+    video_duration: float,
+    client,
+    model: str,
+    rules: dict,
+) -> list[dict]:
+    """Semantic B-roll slot selection: Gemini picks the BEST moments, Python enforces rules.
+
+    Gemini analyzes what is being discussed and selects moments where:
+    - A specific topic is discussed for 5+ seconds continuously
+    - The content has a clear visual concept for stock footage
+    - The moment benefits from visual reinforcement
+    Python then validates timing constraints.
+    """
+    target_dur = (rules["min_duration"] + rules["max_duration"]) / 2
+
+    prompt = f"""You are a video editor. Analyze this transcript and find the {rules['max_inserts']} BEST moments to insert B-roll stock footage.
+
+TRANSCRIPT (with exact timestamps):
+{json.dumps(segments, ensure_ascii=False, indent=2)}
+
+Video duration: {video_duration:.1f} seconds
+
+SELECTION CRITERIA:
+1. Speaker discusses a SPECIFIC topic continuously for at least {rules['min_topic_sec']} seconds
+2. The content has a CLEAR VISUAL CONCEPT that stock footage can illustrate
+3. NOT in the first {rules['avoid_first']}s or last {rules['avoid_last']}s of the video
+4. Moments should be at least {rules['min_gap']}s apart
+5. Choose the MOST IMPACTFUL and visually illustratable moments
+
+SCORING — prefer moments where:
+- Speaker describes a specific action or tool (e.g. "email automation", "AI messaging")
+- The topic is sustained (5+ seconds of related speech)
+- A visual would ENHANCE understanding, not just decorate
+- Avoid generic moments or simple greetings
+
+For each chosen moment, return:
+- start: the exact second to BEGIN showing the B-roll overlay (from transcript timestamps)
+- topic: brief topic label
+- context_text: the relevant speech text at this moment
+- query: a SPECIFIC stock footage search query describing the visual scene
+- alternative_queries: 2-3 fallback queries
+
+Return JSON array of exactly {rules['max_inserts']} best moments:
+[{{"start": 19.7, "topic": "email automation setup", "context_text": "...", "query": "person configuring email automation on laptop screen", "alternative_queries": ["email marketing software setup", "business automation tool"]}}]"""
+
+    try:
+        t0 = time.time()
+        response = client.models.generate_content(
+            model=model,
+            contents=[prompt],
+            config={"response_mime_type": "application/json"},
+        )
+        logger.info("BrollScan: семантический поиск моментов %.1f сек", time.time() - t0)
+        raw = json.loads(response.text)
+        if not isinstance(raw, list):
+            raw = []
+    except Exception as e:
+        logger.warning("BrollScan: семантический поиск не удался (%s), используем fallback", e)
+        return find_broll_slots(segments, video_duration, rules)
+
+    if not raw:
+        logger.warning("BrollScan: Gemini не вернул моменты, используем fallback")
+        return find_broll_slots(segments, video_duration, rules)
+
+    # Normalize: add end time based on target duration
+    for slot in raw:
+        if "start" not in slot:
+            continue
+        slot["end"] = round(float(slot["start"]) + target_dur, 1)
+
+    # Validate and enforce rules
+    validated = _validate_and_fix_slots(raw, video_duration, rules)
+
+    # Fallback if validation removed too many
+    if len(validated) < 1:
+        logger.warning("BrollScan: все моменты не прошли валидацию, используем fallback")
+        return find_broll_slots(segments, video_duration, rules)
+
+    logger.info("BrollScan: семантические слоты: %s",
+                [(s["start"], s["end"], s.get("topic", "")) for s in validated])
+    return validated
 
 
 def validate_and_fix_plan(tasks: list[dict], rules: dict | None = None) -> list[dict]:
@@ -579,55 +681,20 @@ def scan_broll_suggestions(
     transcript_text, transcript_segments, _ = transcribe(video_path)
     logger.info("BrollScan: транскрипция %.1f сек", time.time() - t0)
 
-    # Step 1: compute slots deterministically
-    slots = find_broll_slots(transcript_segments, duration_sec, rules)
+    # Semantic slot selection: Gemini finds best moments, Python validates constraints
+    slots = find_broll_slots_semantic(transcript_segments, duration_sec, client, model, rules)
     if not slots:
         return []
 
-    # Step 2: ask Gemini for stock queries for each slot
-    slots_context = [
-        {"slot_index": i + 1, "start": s["start"], "end": s["end"],
-         "speech_at_this_moment": s["context_text"]}
-        for i, s in enumerate(slots)
-    ]
-
-    prompt = (
-        f"Full transcript:\n{transcript_text[:8000]}\n\n"
-        f"B-roll slots where stock footage will be inserted:\n{json.dumps(slots_context, ensure_ascii=False, indent=2)}\n\n"
-        "For each slot, suggest a specific stock video search query that VISUALLY illustrates "
-        "what the speaker is saying at that moment. Be specific about the visual scene.\n\n"
-        "Return JSON array, one item per slot:\n"
-        '[{"slot_index": 1, "query": "...", "alternative_queries": ["...", "..."]}, ...]'
-    )
-
-    t0 = time.time()
-    logger.info("BrollScan: запрос stock-запросов к Gemini...")
-    response = client.models.generate_content(
-        model=model,
-        contents=[prompt],
-        config={"response_mime_type": "application/json"},
-    )
-    logger.info("BrollScan: Gemini %.1f сек", time.time() - t0)
-
-    try:
-        queries = json.loads(response.text)
-        if not isinstance(queries, list):
-            queries = []
-    except (json.JSONDecodeError, TypeError):
-        queries = []
-
-    # Merge slots + queries
-    query_map = {q.get("slot_index", i + 1): q for i, q in enumerate(queries)}
     result = []
-    for i, slot in enumerate(slots):
-        q = query_map.get(i + 1, {})
+    for slot in slots:
         result.append({
             "start": slot["start"],
             "end": slot["end"],
             "duration": round(slot["end"] - slot["start"], 1),
-            "context_text": slot["context_text"],
-            "query": q.get("query", slot["context_text"][:60]),
-            "alternative_queries": q.get("alternative_queries", []),
+            "context_text": slot.get("context_text", ""),
+            "query": slot.get("query", slot.get("topic", slot.get("context_text", "")[:60])),
+            "alternative_queries": slot.get("alternative_queries", []),
         })
 
     logger.info("BrollScan: %d предложений готово", len(result))
