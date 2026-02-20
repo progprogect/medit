@@ -14,23 +14,42 @@ from schemas.tasks import PlanResponse
 
 logger = logging.getLogger(__name__)
 
-LONG_VIDEO_THRESHOLD_SEC = 120  # 2 minutes — использовать Whisper + низкий FPS
+LONG_VIDEO_THRESHOLD_SEC = 120  # 2 minutes — меньше кадров для анализа
 
-SYSTEM_INSTRUCTION = """You are a video editing assistant. Given a video (and optionally a transcript) and a user's text request, you generate a JSON plan: scenario_name, scenario_description, metadata, and a list of editing tasks.
+SYSTEM_INSTRUCTION = """You are a video editing assistant. Given a video, a transcript, and a user's text request, you generate a JSON plan: scenario_name, scenario_description, metadata, and a list of editing tasks.
 
-Available task types:
-- add_text_overlay: Overlay text. Params: text, position (top_center, bottom_center, top_left, top_right, bottom_left, bottom_right, center), font_size, font_color, start_time (optional), end_time (optional)
-- trim: Cut video. Params: start (seconds), end (seconds)
-- resize: Change dimensions. Params: width, height (optional)
-- change_speed: Playback speed. Params: factor (0.5 = half, 2.0 = double)
-- add_subtitles: Burn-in subtitles. Params: segments (array of {start, end, text})
-- add_image_overlay: Overlay image. Params: image_path or image_data, position, start_time (optional), end_time (optional), opacity (optional)
-- auto_frame_face: Crop to follow face (vertical format). Params: target_ratio (e.g. "9:16")
-- color_correction: Adjust colors. Params: brightness (optional), contrast (optional), saturation (optional)
-- concat: Concatenate clips. Params: clip_paths (array of paths)
-- zoompan: Zoom/pan effect. Params: zoom, duration, x (optional), y (optional)
+CRITICAL RULE: Every task MUST have fully populated params. NEVER return empty params {}.
 
-SELF-CHECK: Before returning, verify that your tasks match the user's request and content best practices (hooks, retention, clear structure). Ensure timestamps are logical. If something is off, adjust the plan.
+Task types with required params — use EXACTLY these formats:
+
+add_text_overlay — required: text, position, font_size, font_color; optional: start_time, end_time
+  Example: {"type": "add_text_overlay", "params": {"text": "B2B лидогенерация — это реально", "position": "bottom_center", "font_size": 48, "font_color": "white", "start_time": 0.0, "end_time": 4.0}}
+
+trim — required: start, end (seconds)
+  Example: {"type": "trim", "params": {"start": 5.0, "end": 45.0}}
+
+resize — required: width; optional: height (omit to keep aspect ratio)
+  Example: {"type": "resize", "params": {"width": 1080, "height": 1920}}
+
+change_speed — required: factor (0.5 = slow 2x, 2.0 = fast 2x)
+  Example: {"type": "change_speed", "params": {"factor": 1.25}}
+
+add_subtitles — required: segments (array of objects with start, end, text — use timestamps from the transcript)
+  Example: {"type": "add_subtitles", "params": {"segments": [{"start": 0.0, "end": 3.5, "text": "Привет, я Никита"}, {"start": 3.5, "end": 7.0, "text": "Помогаю B2B компаниям"}]}}
+
+auto_frame_face — required: target_ratio
+  Example: {"type": "auto_frame_face", "params": {"target_ratio": "9:16"}}
+
+color_correction — at least one of: brightness (-1..1), contrast (-1..1), saturation (-1..1)
+  Example: {"type": "color_correction", "params": {"brightness": 0.05, "contrast": 0.1, "saturation": 0.1}}
+
+zoompan — required: zoom, duration
+  Example: {"type": "zoompan", "params": {"zoom": 1.2, "duration": 3.0}}
+
+concat — required: clip_paths (array of absolute file paths)
+  Example: {"type": "concat", "params": {"clip_paths": ["/path/a.mp4", "/path/b.mp4"]}}
+
+SELF-CHECK: Before returning — verify every task has non-empty params with all required fields filled. Verify timestamps are logical and match the transcript. Remove any task with empty params.
 
 Generate ONLY valid JSON. No markdown. Tasks execute in order."""
 
@@ -97,11 +116,10 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
     transcript_text = ""
     transcript_segments: list[dict] = []
 
-    if is_long:
-        t0 = time.time()
-        logger.info("Gemini: длинное видео (%.0f сек), транскрипция Whisper...", duration_sec)
-        transcript_text, transcript_segments, _ = transcribe(video_path)
-        logger.info("Gemini: транскрипция заняла %.1f сек", time.time() - t0)
+    t0 = time.time()
+    logger.info("Gemini: транскрипция Whisper (%.0f сек видео)...", duration_sec)
+    transcript_text, transcript_segments, _ = transcribe(video_path)
+    logger.info("Gemini: транскрипция заняла %.1f сек", time.time() - t0)
 
     if use_files_api:
         t0 = time.time()
@@ -127,25 +145,21 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
         video_bytes = video_path.read_bytes()
         video_part = types.Part.from_bytes(data=video_bytes, mime_type="video/mp4")
 
-    prompt_parts = [
-        f"User request: {user_prompt}\n\n"
-        "Return JSON with scenario_name, scenario_description, metadata (e.g. timestamps for YouTube), and tasks array. "
-        "Each task has type and params. Execute tasks in order.",
-    ]
-    if transcript_text:
-        prompt_parts.insert(
-            0,
-            f"""Transcript of the video (for context — use this to find hooks and key moments):
----
-{transcript_text[:15000]}
-"""
-        )
-        if transcript_segments:
-            prompt_parts.append(
-                f"\n\nAvailable subtitle segments (start, end, text): {json.dumps(transcript_segments[:100])}"
-            )
+    segments_for_prompt = transcript_segments[:200] if transcript_segments else []
+    transcript_block = (
+        f"VIDEO TRANSCRIPT (use timestamps for all time-based params):\n---\n{transcript_text[:15000]}\n---\n"
+        f"Segments with exact timestamps: {json.dumps(segments_for_prompt)}\n\n"
+        if transcript_text else ""
+    )
 
-    prompt = "\n".join(prompt_parts)
+    prompt_parts = [
+        transcript_block,
+        f"User request: {user_prompt}\n\n"
+        "Return JSON with scenario_name, scenario_description, metadata (e.g. YouTube timestamps), and tasks array. "
+        "EVERY task must have fully filled params — never empty {}.",
+    ]
+
+    prompt = "".join(prompt_parts)
 
     t_gen = time.time()
     logger.info("Gemini: вызов generate_content...")
@@ -165,11 +179,19 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
 
     data = json.loads(response.text)
     validated = PlanResponse.model_validate(data)
+    tasks = []
+    for t in validated.tasks:
+        if not t.params:
+            logger.warning("Gemini: задача %s вернула пустые params, пропускаем", t.type)
+            continue
+        tasks.append({"type": t.type, "params": t.params})
+    if not tasks:
+        logger.warning("Gemini: все задачи имели пустые params — возможно, нужно переформулировать промпт")
     return {
         "scenario_name": validated.scenario_name,
         "scenario_description": validated.scenario_description,
         "metadata": validated.metadata,
-        "tasks": [{"type": t.type, "params": t.params} for t in validated.tasks],
+        "tasks": tasks,
     }
 
 
