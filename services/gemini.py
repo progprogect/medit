@@ -240,57 +240,90 @@ def _get_video_duration(video_path: Path) -> float:
 
 def _repair_broll_plan(tasks: list[dict]) -> list[dict]:
     """
-    Post-process Gemini's task list to fix common B-roll plan defects:
-    1. fetch_stock_* tasks without output_id → auto-assign "stock_N"
-    2. trim(inputs=['source']) tasks without output_id → auto-assign "clip_N"
-    3. concat task with empty params and no inputs → fill inputs from the sequence above
-    Returns fixed task list.
-    """
-    has_fetch = any(t["type"] in ("fetch_stock_video", "fetch_stock_image") for t in tasks)
-    if not has_fetch:
-        return tasks  # nothing to repair, not a B-roll plan
+    Fix B-roll plans where Gemini forgets output_ids and concat inputs.
 
-    sequence: list[str] = []  # ordered output_ids as they appear in the plan
-    repaired: list[dict] = []
+    Rules:
+    - fetch_stock_video → assign output_id, add to concat sequence (video only!)
+    - fetch_stock_image → assign output_id, do NOT add to concat (images go as overlays)
+    - trim tasks in B-roll plan → force inputs=['source'], assign output_id, add to concat sequence
+    - concat → fill inputs from sequence in plan order
+    - post-processing tasks (add_text_overlay, color_correction, resize, etc.) stay AFTER concat
+    """
+    has_fetch_video = any(t["type"] == "fetch_stock_video" for t in tasks)
+    if not has_fetch_video:
+        # No video B-roll → nothing to repair for concat
+        # Still assign output_ids to fetch_stock_image for overlay use
+        for i, task in enumerate(tasks):
+            if task["type"] == "fetch_stock_image" and not task.get("output_id"):
+                tasks[i] = dict(task)
+                tasks[i]["output_id"] = f"stock_img_{i}"
+        return tasks
+
+    ASSEMBLY_TYPES = {"trim", "fetch_stock_video", "fetch_stock_image"}
+    POST_TYPES = {"add_text_overlay", "add_subtitles", "color_correction", "zoompan",
+                  "add_image_overlay", "resize", "auto_frame_face", "change_speed"}
+
+    assembly: list[dict] = []
+    post_processing: list[dict] = []
+    concat_task: dict | None = None
+
     stock_counter = 0
     clip_counter = 0
-    concat_idx: int | None = None
+    sequence: list[str] = []  # concat sequence (video clips only)
 
-    for i, task in enumerate(tasks):
+    for task in tasks:
         task = dict(task)
         t_type = task["type"]
 
-        if t_type in ("fetch_stock_video", "fetch_stock_image"):
+        if t_type == "fetch_stock_video":
             if not task.get("output_id"):
                 stock_counter += 1
                 task["output_id"] = f"stock_{stock_counter}"
-                logger.info("Repair: auto output_id='%s' для %s", task["output_id"], t_type)
+                logger.info("Repair: auto output_id='%s' для fetch_stock_video", task["output_id"])
             sequence.append(task["output_id"])
+            assembly.append(task)
 
-        elif t_type == "trim" and task.get("inputs") == ["source"]:
+        elif t_type == "fetch_stock_image":
+            if not task.get("output_id"):
+                stock_counter += 1
+                task["output_id"] = f"stock_img_{stock_counter}"
+                logger.info("Repair: auto output_id='%s' для fetch_stock_image", task["output_id"])
+            # Images go to assembly but NOT to sequence (can't concat video+image)
+            assembly.append(task)
+
+        elif t_type == "trim":
+            # Force all trims in a B-roll plan to read from original source
+            if not task.get("inputs"):
+                task["inputs"] = ["source"]
             if not task.get("output_id"):
                 clip_counter += 1
                 task["output_id"] = f"clip_{clip_counter}"
-                logger.info("Repair: auto output_id='%s' для trim(source)", task["output_id"])
+                logger.info("Repair: auto output_id='%s', inputs=['source'] для trim", task["output_id"])
             sequence.append(task["output_id"])
+            assembly.append(task)
 
         elif t_type == "concat":
-            concat_idx = len(repaired)
+            concat_task = task  # capture, will rebuild below
 
-        repaired.append(task)
+        elif t_type in POST_TYPES:
+            post_processing.append(task)
 
-    # Fix concat: if it has no inputs but we built a sequence, fill it in
-    if concat_idx is not None and sequence:
-        concat_task = repaired[concat_idx]
-        if not concat_task.get("inputs") and not concat_task.get("params", {}).get("clip_paths"):
-            concat_task["inputs"] = sequence
-            concat_task["params"] = {}
-            logger.info("Repair: заполнены inputs concat: %s", sequence)
-    elif has_fetch and sequence and concat_idx is None:
-        # No concat task at all — add one at the end
-        logger.info("Repair: concat отсутствует, добавляем в конец: %s", sequence)
-        repaired.append({"type": "concat", "params": {}, "inputs": sequence})
+        # Other unknown types — keep in post_processing
+        else:
+            post_processing.append(task)
 
+    if not sequence:
+        return tasks  # nothing useful found
+
+    # Build concat with the full interleaved sequence
+    if concat_task is None:
+        concat_task = {"type": "concat", "params": {}}
+    concat_task["inputs"] = sequence
+    concat_task["params"] = {}
+    logger.info("Repair: concat inputs = %s", sequence)
+
+    # Final plan: assembly → concat → post-processing
+    repaired = assembly + [concat_task] + post_processing
     return repaired
 
 
