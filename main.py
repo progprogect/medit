@@ -94,7 +94,10 @@ async def execute(req: ExecuteRequest):
         finally:
             temp_path.unlink(missing_ok=True)
 
-    output_key = await asyncio.to_thread(_execute)
+    try:
+        output_key = await asyncio.to_thread(_execute)
+    except RuntimeError as e:
+        raise HTTPException(422, str(e))
     download_url = storage.get_download_url(output_key, is_output=True)
     return ProcessResponse(output_key=output_key, download_url=download_url)
 

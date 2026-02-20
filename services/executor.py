@@ -46,6 +46,20 @@ def _escape_drawtext(s: str) -> str:
     return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
+def _ffmpeg_run(cmd: list[str], task_name: str) -> None:
+    """Run FFmpeg command. On failure, log stderr and re-raise with a clear message."""
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode("utf-8", errors="replace").strip()
+        logger.error("Executor: FFmpeg ошибка в '%s' (exit %d):\n%s",
+                     task_name, e.returncode, stderr[-3000:])
+        raise RuntimeError(
+            f"FFmpeg failed in '{task_name}' (exit {e.returncode}). "
+            f"See logs for details."
+        ) from e
+
+
 def _build_drawtext(
     font: str,
     text: str,
@@ -215,9 +229,9 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             )
 
             out = _temp_path(output_path, "step_text", ".mp4")
-            subprocess.run(
+            _ffmpeg_run(
                 ["ffmpeg", "-y", "-i", str(src), "-vf", drawtext, "-c:a", "copy", str(out)],
-                check=True, capture_output=True,
+                "add_text_overlay",
             )
             temp_paths.append(out)
             _register(task, out)
@@ -228,11 +242,12 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             start = params.get("start", 0)
             end = params.get("end")
             out = _temp_path(output_path, "step_trim", ".mp4")
-            cmd = ["ffmpeg", "-y", "-i", str(src), "-ss", str(start)]
+            # -ss before -i = input seeking (fast, avoids exit 234 when start > file duration)
+            cmd = ["ffmpeg", "-y", "-ss", str(start)]
             if end is not None:
                 cmd.extend(["-to", str(end)])
-            cmd.extend(["-c", "copy", str(out)])
-            subprocess.run(cmd, check=True, capture_output=True)
+            cmd.extend(["-i", str(src), "-c", "copy", str(out)])
+            _ffmpeg_run(cmd, "trim")
             temp_paths.append(out)
             _register(task, out)
             logger.info("Executor: trim за %.1f сек", time.time() - t0)
@@ -243,9 +258,9 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             height = params.get("height")
             scale = f"scale={width}:-1" if height is None else f"scale={width}:{height}"
             out = _temp_path(output_path, "step_resize", ".mp4")
-            subprocess.run(
+            _ffmpeg_run(
                 ["ffmpeg", "-y", "-i", str(src), "-vf", scale, "-c:a", "copy", str(out)],
-                check=True, capture_output=True,
+                "resize",
             )
             temp_paths.append(out)
             _register(task, out)
@@ -256,12 +271,12 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             factor = params.get("factor", 1.0)
             pts = 1.0 / factor
             out = _temp_path(output_path, "step_speed", ".mp4")
-            subprocess.run(
+            _ffmpeg_run(
                 ["ffmpeg", "-y", "-i", str(src),
                  "-filter:v", f"setpts={pts}*PTS",
                  "-filter:a", f"atempo={min(factor, 2.0)}",
                  str(out)],
-                check=True, capture_output=True,
+                "change_speed",
             )
             temp_paths.append(out)
             _register(task, out)
@@ -282,11 +297,11 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             try:
                 out = _temp_path(output_path, "step_subtitles", ".mp4")
                 srt_str = str(srt_path).replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
-                subprocess.run(
+                _ffmpeg_run(
                     ["ffmpeg", "-y", "-i", str(src),
                      "-vf", f"subtitles='{srt_str}'",
                      "-c:a", "copy", str(out)],
-                    check=True, capture_output=True,
+                    "add_subtitles",
                 )
                 temp_paths.append(out)
                 _register(task, out)
@@ -323,11 +338,11 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
                 f"[0:v][img]overlay={overlay_pos}{enable_expr}[v]"
             )
             out = _temp_path(output_path, "step_imgoverlay", ".mp4")
-            subprocess.run(
+            _ffmpeg_run(
                 ["ffmpeg", "-y", "-i", str(src), "-i", str(image_path),
                  "-filter_complex", overlay_filter,
                  "-map", "[v]", "-map", "0:a?", "-c:a", "copy", str(out)],
-                check=True, capture_output=True,
+                "add_image_overlay",
             )
             temp_paths.append(out)
             _register(task, out)
@@ -339,10 +354,10 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             w_ratio, h_ratio = map(int, target_ratio.split(":"))
             out = _temp_path(output_path, "step_face", ".mp4")
             crop_filter = f"crop=ih*{w_ratio}/{h_ratio}:ih:(iw-ih*{w_ratio}/{h_ratio})/2:0"
-            subprocess.run(
+            _ffmpeg_run(
                 ["ffmpeg", "-y", "-i", str(src),
                  "-vf", crop_filter, "-c:a", "copy", str(out)],
-                check=True, capture_output=True,
+                "auto_frame_face",
             )
             temp_paths.append(out)
             _register(task, out)
@@ -362,11 +377,11 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
                 eq_parts.append(f"saturation={1 + saturation}")
             out = _temp_path(output_path, "step_color", ".mp4")
             if eq_parts:
-                subprocess.run(
+                _ffmpeg_run(
                     ["ffmpeg", "-y", "-i", str(src),
                      "-vf", "eq=" + ":".join(eq_parts),
                      "-c:a", "copy", str(out)],
-                    check=True, capture_output=True,
+                    "color_correction",
                 )
             else:
                 shutil.copy2(src, out)
@@ -394,10 +409,10 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
                 concat_list = Path(f.name)
             try:
                 out = _temp_path(output_path, "step_concat", ".mp4")
-                subprocess.run(
+                _ffmpeg_run(
                     ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
                      "-i", str(concat_list), "-c", "copy", str(out)],
-                    check=True, capture_output=True,
+                    "concat",
                 )
                 temp_paths.append(out)
                 _register(task, out)
@@ -413,10 +428,10 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             zoompan_filter = (
                 f"zoompan=z='min(zoom+0.0015,{zoom})':d={int(duration * 25)}:s=1280x720"
             )
-            subprocess.run(
+            _ffmpeg_run(
                 ["ffmpeg", "-y", "-i", str(src),
                  "-vf", zoompan_filter, "-c:a", "copy", str(out)],
-                check=True, capture_output=True,
+                "zoompan",
             )
             temp_paths.append(out)
             _register(task, out)
