@@ -378,9 +378,10 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
         else:
             logger.warning("Executor: неизвестный тип задачи %s, пропуск", task_type)
 
-    # Copy final current_path to output_path
+    # Copy final current_path to output_path, then clean up all temp files
     if current_path != output_path:
         shutil.copy2(current_path, output_path)
-        if current_path in temp_paths:
-            current_path.unlink(missing_ok=True)
+    for p in temp_paths:
+        if p != output_path:
+            p.unlink(missing_ok=True)
     return output_path

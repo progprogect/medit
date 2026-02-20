@@ -305,7 +305,12 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
         if not t.params:
             logger.warning("Gemini: задача %s вернула пустые params, пропускаем", t.type)
             continue
-        tasks.append({"type": t.type, "params": t.params})
+        task_dict: dict = {"type": t.type, "params": t.params}
+        if t.output_id is not None:
+            task_dict["output_id"] = t.output_id
+        if t.inputs is not None:
+            task_dict["inputs"] = t.inputs
+        tasks.append(task_dict)
     if not tasks:
         logger.warning("Gemini: все задачи имели пустые params — возможно, нужно переформулировать промпт")
     return {
