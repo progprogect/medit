@@ -48,6 +48,7 @@ def fetch_stock_media(
     dest_dir: Path,
     duration_max: int = 30,
     orientation: str = "landscape",
+    alternatives: list[str] | None = None,
 ) -> Path | None:
     """Search Pexels and download first suitable result.
 
@@ -61,35 +62,46 @@ def fetch_stock_media(
 
     try:
         if media_type == "video":
-            return _fetch_video(query, duration_max, orientation, dest_dir, api_key)
+            return _fetch_video(query, duration_max, orientation, dest_dir, api_key, alternatives or [])
         else:
-            return _fetch_image(query, orientation, dest_dir, api_key)
+            return _fetch_image(query, orientation, dest_dir, api_key, alternatives or [])
     except Exception as e:
         logger.error("Stock: ошибка при поиске '%s': %s", query, e)
         return None
 
 
-def _fallback_queries(query: str) -> list[str]:
-    """Generate progressively simpler fallback queries from the original."""
-    words = query.split()
-    candidates = [query]
-    if len(words) > 3:
-        candidates.append(" ".join(words[:3]))
+def _fallback_queries(query: str, alternatives: list[str] | None = None) -> list[str]:
+    """Build a list of queries from specific to general.
+    Prefers Gemini-provided alternatives over auto-generated ones."""
+    candidates: list[str] = [query]
+
+    # Use Gemini-provided alternatives first (they're semantically meaningful)
+    if alternatives:
+        for alt in alternatives:
+            if alt and alt.strip() and alt != query:
+                candidates.append(alt.strip())
+
+    # Auto-generate fallbacks only if needed
+    words = [w for w in query.split() if len(w) > 3]  # skip short/stop words
+    if len(words) > 2:
+        candidates.append(" ".join(words[:2]))
     if len(words) > 1:
         candidates.append(words[0])
+
     # Deduplicate while preserving order
     seen: set[str] = set()
     return [q for q in candidates if not (q in seen or seen.add(q))]  # type: ignore[func-returns-value]
 
 
 def _fetch_video(
-    query: str, duration_max: int, orientation: str, dest_dir: Path, api_key: str
+    query: str, duration_max: int, orientation: str, dest_dir: Path, api_key: str,
+    alternatives: list[str] | None = None,
 ) -> Path | None:
     pexels_orientation = _map_orientation(orientation)
     videos: list = []
     tried: list[str] = []
 
-    for attempt_query in _fallback_queries(query):
+    for attempt_query in _fallback_queries(query, alternatives):
         tried.append(attempt_query)
         data = _pexels_request(
             PEXELS_VIDEO_SEARCH,
@@ -130,13 +142,14 @@ def _fetch_video(
 
 
 def _fetch_image(
-    query: str, orientation: str, dest_dir: Path, api_key: str
+    query: str, orientation: str, dest_dir: Path, api_key: str,
+    alternatives: list[str] | None = None,
 ) -> Path | None:
     pexels_orientation = _map_orientation(orientation)
     photos: list = []
     tried: list[str] = []
 
-    for attempt_query in _fallback_queries(query):
+    for attempt_query in _fallback_queries(query, alternatives):
         tried.append(attempt_query)
         data = _pexels_request(
             PEXELS_IMAGE_SEARCH,

@@ -17,7 +17,17 @@ logger = logging.getLogger(__name__)
 
 LONG_VIDEO_THRESHOLD_SEC = 120  # 2 minutes — меньше кадров для анализа
 
-SYSTEM_INSTRUCTION = """You are a video editing assistant. Given a video, a transcript, and a user's text request, you generate a JSON plan: scenario_name, scenario_description, metadata, and a list of editing tasks.
+SYSTEM_INSTRUCTION = """You are an expert video editor and content strategist. Given a video, its transcript, and a user's request, you first THINK carefully, then generate a precise, high-quality editing plan.
+
+MANDATORY THINKING PROCESS — before generating tasks:
+1. ANALYZE: What is the video about? What is the speaker saying and when (use transcript timestamps)?
+2. GOAL: What does the user want to achieve? What's the target audience and platform?
+3. BEST PRACTICES: What would a professional editor do? (hook in first 3s, clear CTA, right pacing)
+4. IMAGINE THE OUTPUT: Mentally play through the result. Does it flow well? Is the audio continuous? Are transitions smooth?
+5. VALIDATE: Does the plan match best practices? Is anything excessive or missing? Remove or add tasks accordingly.
+6. FINALIZE: Generate only what's truly needed. Quality > quantity.
+
+Fill scenario_description with your reasoning from steps 1-5 (what you decided and why).
 
 CRITICAL RULE: Every task MUST have fully populated params. NEVER return empty params {}.
 
@@ -81,15 +91,20 @@ concat — preferred: use "inputs" with output_ids; fallback: clip_paths array
     {"type": "trim", "params": {"start": 15, "end": 30}, "inputs": ["source"], "output_id": "clip_b"}
     {"type": "concat", "params": {}, "inputs": ["clip_a", "broll_1", "clip_b"]}
 
-fetch_stock_video — find and download a stock video clip. Required: query. Optional: duration_max (sec), orientation (landscape/portrait/square).
-  MUST have output_id so the clip can be used in later tasks.
-  Example: {"type": "fetch_stock_video", "params": {"query": "business meeting", "duration_max": 10, "orientation": "landscape"}, "output_id": "broll_1"}
+fetch_stock_video — find and download a stock video clip. Required: query (BE SPECIFIC — describe exact visual: action, setting, objects, e.g. "man typing on laptop in modern office" not just "business"). Optional: duration_max (sec), orientation.
+  MUST have output_id. Provide 2-3 alternative_queries (fallbacks if main query fails).
+  Example: {"type": "fetch_stock_video", "params": {"query": "entrepreneur presenting on whiteboard office", "alternative_queries": ["business presentation whiteboard", "business meeting"], "duration_max": 8, "orientation": "portrait"}, "output_id": "broll_1"}
 
-fetch_stock_image — find and download a stock image. Required: query. Optional: orientation.
-  MUST have output_id.
-  Example: {"type": "fetch_stock_image", "params": {"query": "data chart blue", "orientation": "landscape"}, "output_id": "graph_img"}
+fetch_stock_image — find and download a stock image. Required: query (BE SPECIFIC). Optional: orientation. MUST have output_id.
+  Example: {"type": "fetch_stock_image", "params": {"query": "calendar with two highlighted slots", "alternative_queries": ["calendar schedule", "planner"], "orientation": "portrait"}, "output_id": "img_1"}
 
-SELF-CHECK: Before returning — verify every task has non-empty params. Verify timestamps are logical. Remove any task with empty params.
+overlay_video — place a stock video clip OVER the main video at specific timestamps. Original audio continues playing (B-roll technique).
+  Use this instead of concat for B-roll insertions. Required: start_time, end_time, stock_id (output_id of a fetch_stock_video).
+  Example: {"type": "overlay_video", "params": {"start_time": 8.0, "end_time": 14.0, "stock_id": "broll_1"}}
+
+AUDIO RULE: overlay_video preserves original audio. Use it for B-roll. concat is for joining separate clips (e.g. intro + main + outro).
+
+SELF-CHECK: Before returning — verify every task has non-empty params. Verify timestamps are logical and non-overlapping. Remove any task with empty params. Ask yourself: "Would a professional editor approve this?"
 
 Generate ONLY valid JSON. No markdown. Tasks execute in order."""
 
@@ -108,8 +123,8 @@ PLAN_JSON_SCHEMA = {
                         "type": "string",
                         "enum": [
                             "add_text_overlay", "trim", "resize", "change_speed",
-                            "add_subtitles", "add_image_overlay", "auto_frame_face",
-                            "color_correction", "concat", "zoompan",
+                            "add_subtitles", "add_image_overlay", "overlay_video",
+                            "auto_frame_face", "color_correction", "concat", "zoompan",
                             "fetch_stock_video", "fetch_stock_image",
                         ],
                     },
@@ -159,10 +174,12 @@ PLAN_JSON_SCHEMA = {
                             "clip_paths": {"type": "array", "items": {"type": "string"}},
                             "zoom": {"type": "number"},
                             "duration": {"type": "number"},
-                            # fetch_stock_*
+                            # fetch_stock_* / overlay_video
                             "query": {"type": "string"},
+                            "alternative_queries": {"type": "array", "items": {"type": "string"}},
                             "duration_max": {"type": "integer"},
                             "orientation": {"type": "string"},
+                            "stock_id": {"type": "string"},
                         },
                     },
                 },
@@ -315,28 +332,76 @@ def _repair_broll_plan(tasks: list[dict]) -> list[dict]:
     if not sequence:
         return tasks  # nothing useful found
 
-    # Re-interleave: alternate source clips and stock clips properly
+    # --- Convert to overlay_video based B-roll (preserves original audio) ---
+    # Find trim sections and their gaps to determine overlay timestamps
+    trim_sections = sorted(
+        [(t.get("params", {}).get("start", 0), t.get("params", {}).get("end", 0),
+          t.get("output_id", ""))
+         for t in assembly if t["type"] == "trim"],
+        key=lambda x: x[0],
+    )
+    stock_video_ids = [s for s in sequence if s.startswith("stock_") and not s.startswith("stock_img_")]
+
+    # Find gaps between consecutive trim sections (these are where B-roll goes)
+    gaps: list[tuple[float, float]] = []
+    for i in range(len(trim_sections) - 1):
+        gap_start = trim_sections[i][1]
+        gap_end = trim_sections[i + 1][0]
+        if gap_end > gap_start + 0.5:  # only meaningful gaps
+            gaps.append((gap_start, gap_end))
+
+    if gaps and stock_video_ids:
+        # Build overlay-based plan: fetch stocks, then overlay them at gaps
+        fetch_tasks = [t for t in assembly if t["type"] in ("fetch_stock_video", "fetch_stock_image")]
+        trim_tasks_clean = [t for t in assembly if t["type"] == "trim"]
+
+        # Generate overlay tasks for each gap + stock pair
+        overlay_tasks: list[dict] = []
+        for i, (gap_start, gap_end) in enumerate(gaps):
+            if i >= len(stock_video_ids):
+                break
+            stock_id = stock_video_ids[i]
+            overlay_tasks.append({
+                "type": "overlay_video",
+                "params": {"start_time": gap_start, "end_time": gap_end, "stock_id": stock_id},
+            })
+
+        # Any extra stocks without gaps — add overlays after the last trim
+        if trim_sections:
+            last_end = trim_sections[-1][1]
+            for j in range(len(gaps), min(len(stock_video_ids), len(gaps) + 3)):
+                stock_id = stock_video_ids[j]
+                overlay_tasks.append({
+                    "type": "overlay_video",
+                    "params": {"start_time": last_end, "end_time": last_end + 8, "stock_id": stock_id},
+                })
+                last_end += 8
+
+        logger.info("Repair: overlay plan — %d overlays: %s",
+                    len(overlay_tasks), [(t["params"]["start_time"], t["params"]["end_time"]) for t in overlay_tasks])
+
+        # Plan: fetch stocks → overlay them (no concat needed) → post-processing
+        repaired = fetch_tasks + overlay_tasks + post_processing
+        return repaired
+
+    # Fallback: not enough info for overlay → use concat with proper interleaving
     clip_ids = [s for s in sequence if s.startswith("clip_")]
     stock_ids = [s for s in sequence if s.startswith("stock_") and not s.startswith("stock_img_")]
-    # Alternate: clip, stock, clip, stock... then append remaining stock
     interleaved: list[str] = []
     for i, clip_id in enumerate(clip_ids):
         interleaved.append(clip_id)
         if i < len(stock_ids):
             interleaved.append(stock_ids[i])
-    # Any remaining stock clips that didn't pair with a source clip
     interleaved.extend(stock_ids[len(clip_ids):])
     if not interleaved:
-        interleaved = sequence  # fallback to original order
+        interleaved = sequence
 
-    # Build concat with the properly interleaved sequence
     if concat_task is None:
         concat_task = {"type": "concat", "params": {}}
     concat_task["inputs"] = interleaved
     concat_task["params"] = {}
-    logger.info("Repair: concat inputs = %s", interleaved)
+    logger.info("Repair: concat fallback inputs = %s", interleaved)
 
-    # Final plan: assembly → concat → post-processing
     repaired = assembly + [concat_task] + post_processing
     return repaired
 

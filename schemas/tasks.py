@@ -43,6 +43,7 @@ TaskType = Literal[
     "change_speed",
     "add_subtitles",
     "add_image_overlay",
+    "overlay_video",
     "auto_frame_face",
     "color_correction",
     "concat",

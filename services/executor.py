@@ -536,6 +536,58 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             _register(task, out)
             logger.info("Executor: zoompan за %.1f сек", time.time() - t0)
 
+        elif task_type == "overlay_video":
+            # Overlay a stock clip on top of the main video at specific timestamps.
+            # Original audio is ALWAYS preserved (no audio from stock).
+            src = _resolve_input(task)
+
+            # Stock clip: from params.stock_id or second element of inputs
+            stock_id = params.get("stock_id")
+            overlay_path: Path | None = None
+            if stock_id and stock_id in registry:
+                overlay_path = registry[stock_id]
+            else:
+                inp_list = task.get("inputs", [])
+                if len(inp_list) >= 2:
+                    overlay_path = registry.get(inp_list[1])
+
+            if overlay_path is None or not overlay_path.exists():
+                logger.warning("Executor: overlay_video — stock клип не найден, пропуск")
+                continue
+
+            start_time = float(params.get("start_time", 0))
+            end_time = params.get("end_time")
+            w, h = _get_video_size(src)
+
+            scale_filter = (
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,fps=30,"
+                f"setpts=PTS-STARTPTS+{start_time}/TB"
+            )
+            enable_expr = (
+                f"between(t,{start_time},{end_time})" if end_time
+                else f"gte(t,{start_time})"
+            )
+            filter_cx = (
+                f"[1:v]{scale_filter}[broll];"
+                f"[0:v][broll]overlay=enable='{enable_expr}'[v]"
+            )
+
+            out = _temp_path(output_path, "step_broll", ".mp4")
+            _ffmpeg_run(
+                ["ffmpeg", "-y",
+                 "-i", str(src), "-i", str(overlay_path),
+                 "-filter_complex", filter_cx,
+                 "-map", "[v]", "-map", "0:a",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy",
+                 str(out)],
+                "overlay_video",
+            )
+            temp_paths.append(out)
+            _register(task, out)
+            logger.info("Executor: overlay_video t=%.1f-%.1f за %.1f сек",
+                        start_time, end_time or 0, time.time() - t0)
+
         elif task_type in ("fetch_stock_video", "fetch_stock_image"):
             from services.stock import fetch_stock_media
             query = params.get("query", "")
@@ -547,12 +599,14 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             orientation = params.get("orientation", "landscape")
             dest_dir = output_path.parent
 
+            alternatives = params.get("alternative_queries") or []
             media_path = fetch_stock_media(
                 query=query,
                 media_type=media_type,
                 duration_max=duration_max,
                 orientation=orientation,
                 dest_dir=dest_dir,
+                alternatives=alternatives,
             )
             if media_path is None:
                 logger.warning("Executor: %s — ничего не найдено по запросу '%s', пропуск",
