@@ -46,6 +46,84 @@ def _escape_drawtext(s: str) -> str:
     return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
+def _is_image_file(path: Path) -> bool:
+    return path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")
+
+
+def _get_video_size(path: Path) -> tuple[int, int]:
+    """Return (width, height) of a video file via ffprobe."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return 1080, 1920
+    lines = r.stdout.strip().splitlines()
+    try:
+        return int(lines[0]), int(lines[1])
+    except (ValueError, IndexError):
+        return 1080, 1920
+
+
+def _normalize_for_concat(
+    path: Path,
+    w: int,
+    h: int,
+    is_stock: bool,
+    work_dir: Path,
+) -> Path:
+    """
+    Transcode a clip (or image) to a common H.264/AAC format for concat.
+    Stock clips get their audio stripped and replaced with silence.
+    Images are converted to a 3-second video.
+    """
+    out = work_dir / f"cnorm_{abs(hash(str(path))) % 10000000}.mp4"
+    # Scale to target size, letterbox/pillarbox with black, ensure 30 fps
+    scale = (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30"
+    )
+
+    if _is_image_file(path):
+        # Image → 3-second video with silent audio
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-loop", "1", "-i", str(path),
+            "-t", "3",
+            "-vf", scale,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-map", "1:v", "-map", "0:a",
+            "-shortest", str(out),
+        ]
+    elif is_stock:
+        # Stock video → re-encode, replace audio with silence
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-i", str(path),
+            "-vf", scale,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-map", "1:v", "-map", "0:a",
+            "-shortest", str(out),
+        ]
+    else:
+        # Source clip → re-encode to common format, keep audio
+        cmd = [
+            "ffmpeg", "-y", "-i", str(path),
+            "-vf", scale,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            str(out),
+        ]
+    _ffmpeg_run(cmd, "normalize_for_concat")
+    return out
+
+
 def _ffmpeg_run(cmd: list[str], task_name: str) -> None:
     """Run FFmpeg command. On failure, log stderr and re-raise with a clear message."""
     try:
@@ -147,6 +225,8 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
     registry: dict[str, Path] = {"source": input_path}
     # Default linear chain pointer
     current_path: Path = input_path
+    # Paths downloaded from stock (need audio stripping in concat)
+    stock_paths: set[Path] = set()
 
     def _register(task: dict, result_path: Path, advance_chain: bool = True) -> None:
         """Store result in registry and optionally advance the linear current_path."""
@@ -402,10 +482,28 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
                 logger.warning("Executor: concat — нет clip_paths/inputs, пропуск")
                 continue
 
+            # Determine target size from the first non-stock, non-image clip
+            target_w, target_h = 1080, 1920
+            for cp in clip_paths_resolved:
+                if cp not in stock_paths and not _is_image_file(cp):
+                    target_w, target_h = _get_video_size(cp)
+                    break
+
+            # Normalize all clips to common format before concat
+            normalized: list[Path] = []
+            norm_temps: list[Path] = []
+            for cp in clip_paths_resolved:
+                is_stock = cp in stock_paths or _is_image_file(cp)
+                np_ = _normalize_for_concat(cp, target_w, target_h, is_stock, output_path.parent)
+                normalized.append(np_)
+                norm_temps.append(np_)
+                temp_paths.append(np_)
+            logger.info("Executor: нормализовано %d клипов (%dx%d)", len(normalized), target_w, target_h)
+
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".txt", delete=False, encoding="utf-8"
             ) as f:
-                for p in clip_paths_resolved:
+                for p in normalized:
                     f.write(f"file '{p.absolute()}'\n")
                 concat_list = Path(f.name)
             try:
@@ -463,6 +561,7 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
             temp_paths.append(media_path)
             # fetch_stock tasks only put media into the registry for later use;
             # they must NOT override current_path so linear chain stays on the main video
+            stock_paths.add(media_path)
             _register(task, media_path, advance_chain=False)
             logger.info("Executor: %s скачано за %.1f сек: %s",
                         task_type, time.time() - t0, media_path)

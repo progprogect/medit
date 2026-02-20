@@ -315,12 +315,26 @@ def _repair_broll_plan(tasks: list[dict]) -> list[dict]:
     if not sequence:
         return tasks  # nothing useful found
 
-    # Build concat with the full interleaved sequence
+    # Re-interleave: alternate source clips and stock clips properly
+    clip_ids = [s for s in sequence if s.startswith("clip_")]
+    stock_ids = [s for s in sequence if s.startswith("stock_") and not s.startswith("stock_img_")]
+    # Alternate: clip, stock, clip, stock... then append remaining stock
+    interleaved: list[str] = []
+    for i, clip_id in enumerate(clip_ids):
+        interleaved.append(clip_id)
+        if i < len(stock_ids):
+            interleaved.append(stock_ids[i])
+    # Any remaining stock clips that didn't pair with a source clip
+    interleaved.extend(stock_ids[len(clip_ids):])
+    if not interleaved:
+        interleaved = sequence  # fallback to original order
+
+    # Build concat with the properly interleaved sequence
     if concat_task is None:
         concat_task = {"type": "concat", "params": {}}
-    concat_task["inputs"] = sequence
+    concat_task["inputs"] = interleaved
     concat_task["params"] = {}
-    logger.info("Repair: concat inputs = %s", sequence)
+    logger.info("Repair: concat inputs = %s", interleaved)
 
     # Final plan: assembly → concat → post-processing
     repaired = assembly + [concat_task] + post_processing
