@@ -1,0 +1,15 @@
+.env
+uploads/
+outputs/
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env.local
+*.log
+.DS_Store
+*.mp4
+*.mov
+*.avi
+*.webm
