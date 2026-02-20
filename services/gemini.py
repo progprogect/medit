@@ -238,6 +238,62 @@ def _get_video_duration(video_path: Path) -> float:
         return 0.0
 
 
+def _repair_broll_plan(tasks: list[dict]) -> list[dict]:
+    """
+    Post-process Gemini's task list to fix common B-roll plan defects:
+    1. fetch_stock_* tasks without output_id → auto-assign "stock_N"
+    2. trim(inputs=['source']) tasks without output_id → auto-assign "clip_N"
+    3. concat task with empty params and no inputs → fill inputs from the sequence above
+    Returns fixed task list.
+    """
+    has_fetch = any(t["type"] in ("fetch_stock_video", "fetch_stock_image") for t in tasks)
+    if not has_fetch:
+        return tasks  # nothing to repair, not a B-roll plan
+
+    sequence: list[str] = []  # ordered output_ids as they appear in the plan
+    repaired: list[dict] = []
+    stock_counter = 0
+    clip_counter = 0
+    concat_idx: int | None = None
+
+    for i, task in enumerate(tasks):
+        task = dict(task)
+        t_type = task["type"]
+
+        if t_type in ("fetch_stock_video", "fetch_stock_image"):
+            if not task.get("output_id"):
+                stock_counter += 1
+                task["output_id"] = f"stock_{stock_counter}"
+                logger.info("Repair: auto output_id='%s' для %s", task["output_id"], t_type)
+            sequence.append(task["output_id"])
+
+        elif t_type == "trim" and task.get("inputs") == ["source"]:
+            if not task.get("output_id"):
+                clip_counter += 1
+                task["output_id"] = f"clip_{clip_counter}"
+                logger.info("Repair: auto output_id='%s' для trim(source)", task["output_id"])
+            sequence.append(task["output_id"])
+
+        elif t_type == "concat":
+            concat_idx = len(repaired)
+
+        repaired.append(task)
+
+    # Fix concat: if it has no inputs but we built a sequence, fill it in
+    if concat_idx is not None and sequence:
+        concat_task = repaired[concat_idx]
+        if not concat_task.get("inputs") and not concat_task.get("params", {}).get("clip_paths"):
+            concat_task["inputs"] = sequence
+            concat_task["params"] = {}
+            logger.info("Repair: заполнены inputs concat: %s", sequence)
+    elif has_fetch and sequence and concat_idx is None:
+        # No concat task at all — add one at the end
+        logger.info("Repair: concat отсутствует, добавляем в конец: %s", sequence)
+        repaired.append({"type": "concat", "params": {}, "inputs": sequence})
+
+    return repaired
+
+
 def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
     """
     Analyze video with Gemini and generate editing plan (scenario + metadata + tasks).
@@ -334,7 +390,6 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
     validated = PlanResponse.model_validate(data)
     tasks = []
     for t in validated.tasks:
-        # params может быть {} для concat с inputs — это валидно
         if not t.params and t.inputs is None:
             logger.warning("Gemini: задача %s вернула пустые params и нет inputs, пропускаем", t.type)
             continue
@@ -346,6 +401,8 @@ def analyze_and_generate_plan(video_path: Path, user_prompt: str) -> dict:
         tasks.append(task_dict)
     if not tasks:
         logger.warning("Gemini: все задачи имели пустые params — возможно, нужно переформулировать промпт")
+
+    tasks = _repair_broll_plan(tasks)
     return {
         "scenario_name": validated.scenario_name,
         "scenario_description": validated.scenario_description,
