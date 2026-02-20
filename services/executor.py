@@ -20,25 +20,74 @@ logger = logging.getLogger(__name__)
 
 def _get_default_font() -> str:
     if platform.system() == "Darwin":
+        # Arial supports Cyrillic; Helvetica.ttc does not
+        arial = Path("/System/Library/Fonts/Supplemental/Arial.ttf")
+        if arial.exists():
+            return str(arial)
         return "/System/Library/Fonts/Helvetica.ttc"
     return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 
-def _position_to_drawtext(position: str) -> str:
+def _position_to_drawtext(position: str, margin: int = 50) -> str:
+    """Convert named position to FFmpeg drawtext x/y with a sensible margin."""
     positions = {
-        "top_center": "x=(w-text_w)/2:y=20",
-        "bottom_center": "x=(w-text_w)/2:y=h-th-20",
-        "top_left": "x=20:y=20",
-        "top_right": "x=w-text_w-20:y=20",
-        "bottom_left": "x=20:y=h-th-20",
-        "bottom_right": "x=w-text_w-20:y=h-th-20",
-        "center": "x=(w-text_w)/2:y=(h-text_h)/2",
+        "top_center":    f"x=(w-text_w)/2:y={margin}",
+        "bottom_center": f"x=(w-text_w)/2:y=h-th-{margin}",
+        "top_left":      f"x={margin}:y={margin}",
+        "top_right":     f"x=w-text_w-{margin}:y={margin}",
+        "bottom_left":   f"x={margin}:y=h-th-{margin}",
+        "bottom_right":  f"x=w-text_w-{margin}:y=h-th-{margin}",
+        "center":        "x=(w-text_w)/2:y=(h-text_h)/2",
     }
-    return positions.get(position, positions["top_center"])
+    return positions.get(position, positions["bottom_center"])
 
 
 def _escape_drawtext(s: str) -> str:
     return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _build_drawtext(
+    font: str,
+    text: str,
+    font_size: int,
+    font_color: str,
+    pos_expr: str,
+    start_time: float | None,
+    end_time: float | None,
+    background: str | None,
+    shadow: bool,
+    border_color: str | None,
+    border_width: int,
+) -> str:
+    """Assemble FFmpeg drawtext filter string with optional styling."""
+    escaped = _escape_drawtext(text)
+    parts = [
+        f"drawtext=fontfile='{font}'",
+        f"text='{escaped}'",
+        f"fontsize={font_size}",
+        f"fontcolor={font_color}",
+        pos_expr,
+    ]
+
+    if shadow:
+        parts += ["shadowx=2", "shadowy=2", "shadowcolor=black@0.8"]
+
+    if border_color and border_width:
+        parts += [f"borderw={border_width}", f"bordercolor={border_color}"]
+
+    if background and background != "none":
+        if background == "dark":
+            box_color = "black@0.55"
+        elif background == "light":
+            box_color = "white@0.55"
+        else:
+            box_color = background  # e.g. "black@0.7" or "#000000@0.5"
+        parts += ["box=1", f"boxcolor={box_color}", "boxborderw=12"]
+
+    if start_time is not None:
+        parts.append(f"enable='between(t,{start_time},{end_time or 99999})'")
+
+    return ":".join(parts)
 
 
 def _format_srt(segments: list[dict]) -> str:
@@ -125,20 +174,45 @@ def run_tasks(input_path: Path, tasks: list[dict], output_path: Path) -> Path:
 
         if task_type == "add_text_overlay":
             src = _resolve_input(task)
-            text = _escape_drawtext(params.get("text", ""))
-            position = params.get("position", "top_center")
+            text = params.get("text", "")
             font_size = params.get("font_size", 48)
             font_color = params.get("font_color", "white")
             start_time = params.get("start_time")
             end_time = params.get("end_time")
+            shadow = bool(params.get("shadow", False))
+            background = params.get("background")  # "dark", "light", "none", or "color@opacity"
+            border_color = params.get("border_color")
+            border_width = int(params.get("border_width", 0))
+            margin = int(params.get("margin", 50))
 
-            pos_expr = _position_to_drawtext(position)
-            drawtext = (
-                f"drawtext=fontfile='{font}':text='{text}':"
-                f"fontsize={font_size}:fontcolor={font_color}:{pos_expr}"
+            # Custom x/y take precedence over named position
+            if "x" in params and "y" in params:
+                x_val = params["x"]
+                y_val = params["y"]
+                # Support percentage strings like "50%", plain int pixels, or FFmpeg expressions
+                def _resolve_coord(v, dim_expr: str) -> str:
+                    if isinstance(v, str) and v.endswith("%"):
+                        pct = float(v[:-1]) / 100.0
+                        return f"({dim_expr}*{pct:.4f})"
+                    return str(v)
+                pos_expr = f"x={_resolve_coord(x_val, 'w')}:y={_resolve_coord(y_val, 'h')}"
+            else:
+                position = params.get("position", "bottom_center")
+                pos_expr = _position_to_drawtext(position, margin)
+
+            drawtext = _build_drawtext(
+                font=font,
+                text=text,
+                font_size=font_size,
+                font_color=font_color,
+                pos_expr=pos_expr,
+                start_time=start_time,
+                end_time=end_time,
+                background=background,
+                shadow=shadow,
+                border_color=border_color,
+                border_width=border_width,
             )
-            if start_time is not None:
-                drawtext += f":enable='between(t,{start_time},{end_time or 99999})'"
 
             out = _temp_path(output_path, "step_text", ".mp4")
             subprocess.run(

@@ -30,8 +30,17 @@ Simple linear tasks do NOT need output_id or inputs.
 
 Task types with required params — use EXACTLY these formats:
 
-add_text_overlay — required: text, position, font_size, font_color; optional: start_time, end_time
-  Example: {"type": "add_text_overlay", "params": {"text": "B2B лидогенерация — это реально", "position": "bottom_center", "font_size": 48, "font_color": "white", "start_time": 0.0, "end_time": 4.0}}
+add_text_overlay — required: text, font_size, font_color; position OR (x, y); optional: start_time, end_time, margin, shadow, background, border_color, border_width
+  position values: top_center, bottom_center, top_left, top_right, bottom_left, bottom_right, center
+  x, y values: integer pixels, "50%" percentage, or FFmpeg expression like "(w-text_w)/2"
+  margin: pixels from edge when using position (default 50)
+  shadow: true/false — drop shadow for readability
+  background: "dark" (black@0.55), "light" (white@0.55), "none", or custom "black@0.7"
+  border_color + border_width: text outline (e.g. "black", 2)
+  STYLE GUIDE: For reels/ads use shadow=true + background="dark" for key titles. Use border_color="black"+border_width=2 for subtle outlines. Avoid plain white text on bright backgrounds.
+  Examples:
+    {"type": "add_text_overlay", "params": {"text": "B2B лидогенерация", "position": "bottom_center", "font_size": 56, "font_color": "white", "shadow": true, "background": "dark", "start_time": 0.0, "end_time": 4.0}}
+    {"type": "add_text_overlay", "params": {"text": "Привет!", "x": "(w-text_w)/2", "y": "h*0.15", "font_size": 64, "font_color": "#FFD700", "border_color": "black", "border_width": 3, "start_time": 0.0, "end_time": 2.0}}
 
 trim — required: start, end (seconds). Can have output_id to save for concat.
   Example: {"type": "trim", "params": {"start": 5.0, "end": 45.0}, "output_id": "clip_a"}
@@ -118,6 +127,15 @@ PLAN_JSON_SCHEMA = {
                                     "required": ["start", "end", "text"],
                                 },
                             },
+                            # add_text_overlay extra styling
+                            "margin": {"type": "integer"},
+                            "x": {},
+                            "y": {},
+                            "shadow": {"type": "boolean"},
+                            "background": {"type": "string"},
+                            "border_color": {"type": "string"},
+                            "border_width": {"type": "integer"},
+                            # add_image_overlay
                             "image_path": {"type": "string"},
                             "opacity": {"type": "number"},
                             "target_ratio": {"type": "string"},
