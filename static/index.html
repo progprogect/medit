@@ -56,10 +56,12 @@
           <label for="referenceLink">Референс (опционально)</label>
           <input type="url" id="referenceLink" placeholder="https://instagram.com/... или https://youtube.com/...">
         </section>
-        <button id="generateScenarioBtn" class="btn btn-primary" disabled>Generate scenario</button>
-        <div id="createProgress" class="scan-progress hidden">
-          <p class="scan-eta">Генерация сценария… 30–90 сек</p>
+        <div class="create-actions">
+          <button id="generateScenarioBtn" class="btn btn-primary" disabled>Generate scenario</button>
         </div>
+      </div>
+      <div id="createProgress" class="scan-progress hidden">
+        <p class="scan-eta">Генерация сценария… 30–90 сек</p>
       </div>
       <div id="scenarioScreen" class="hidden">
         <div id="scenarioHeader" class="scenario-header"></div>
@@ -136,8 +138,10 @@
         <div id="brollPreview" class="preview hidden">
           <video id="brollVideo" controls></video>
         </div>
-        <a id="brollDownload" class="btn btn-secondary hidden" download>⬇ Скачать видео</a>
-        <button id="brollNewBtn" class="btn btn-ghost" style="margin-left:12px">Новый запуск</button>
+        <div class="output-actions">
+          <a id="brollDownload" class="btn btn-secondary hidden" download>⬇ Скачать видео</a>
+          <button id="brollNewBtn" class="btn btn-ghost">Новый запуск</button>
+        </div>
       </div>
 
     </div>
@@ -150,7 +154,9 @@
         <textarea id="prompt" rows="4" placeholder="Например: Сделай рекламное видео, добавь текстовые тезисы, обрежь до 45 секунд"></textarea>
       </section>
 
-      <button id="analyzeBtn" class="btn btn-primary" disabled>Анализировать</button>
+      <div class="edit-actions">
+        <button id="analyzeBtn" class="btn btn-primary" disabled>Анализировать</button>
+      </div>
 
       <section id="planSection" class="plan-section hidden">
         <h2>План редактирования</h2>
@@ -168,7 +174,9 @@
         <div id="preview" class="preview hidden">
           <video id="previewVideo" controls></video>
         </div>
-        <a id="downloadBtn" class="btn btn-secondary hidden" download>⬇ Скачать видео</a>
+        <div class="output-actions">
+          <a id="downloadBtn" class="btn btn-secondary hidden" download>⬇ Скачать видео</a>
+        </div>
       </section>
 
     </div>
