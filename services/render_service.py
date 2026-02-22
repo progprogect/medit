@@ -120,6 +120,28 @@ def _overlay_to_task_params(
     }
 
 
+def check_scenario_readiness(scenario: Scenario, main_asset_id: str | None) -> None:
+    """
+    Ensure all segments with asset_source=generated have asset_status=ready.
+    Raises RenderBlocked if any are pending.
+    """
+    video_layer = next((l for l in scenario.layers if l.type == "video"), None)
+    if not video_layer or not video_layer.segments:
+        return
+    pending: list[str] = []
+    for seg in video_layer.segments:
+        if (seg.asset_source or "uploaded") != "generated":
+            continue
+        if (seg.asset_status or "ready") != "ready":
+            scene_id = seg.scene_id or seg.id
+            pending.append(scene_id)
+    if pending:
+        unique = list(dict.fromkeys(pending))
+        raise RenderBlocked(
+            f"Сначала сгенерируйте или найдите в стоке для сцен: {', '.join(unique)}"
+        )
+
+
 def scenario_to_render_tasks(
     scenario: Scenario,
     overlay_style: str,
@@ -189,11 +211,13 @@ def render_scenario(
     assets: list[dict],
     overlay_style: str,
     storage: Storage,
+    render_mode: str = "C",
 ) -> str:
     """
     Render scenario to video.
     Full main video + B-roll overlays (at slots) + text overlays.
     Audio from main video throughout.
+    render_mode: A=LLM→tasks, B=LLM+валидация, C=Python+проверка
     """
     main_asset = None
     for a in assets:
@@ -214,6 +238,9 @@ def render_scenario(
     # Build asset lookup
     assets_by_id = {a.get("id"): a for a in assets if a.get("id")}
     main_asset_id = main_asset.get("id")
+
+    # Check readiness: all generated segments must be ready (for all modes)
+    check_scenario_readiness(scenario, main_asset_id)
 
     # Fetch B-roll for B-roll segments (not main video). Main = asset_id == main_asset_id.
     video_layer = next((l for l in scenario.layers if l.type == "video"), None)
@@ -288,9 +315,24 @@ def render_scenario(
                 broll_idx += 1
         logger.info("Render: %d B-roll clips (pre-fetched or from stock)", len(broll_registry))
 
-    tasks = scenario_to_render_tasks(
-        scenario, overlay_style, source_path, broll_registry, main_asset_id
-    )
+    if render_mode in ("A", "B"):
+        from services.gemini import BROLL_RULES, scenario_to_llm_tasks, validate_and_fix_plan
+
+        broll_ids = list(broll_registry.keys())
+        tasks = scenario_to_llm_tasks(scenario, overlay_style, broll_ids)
+        if render_mode == "B":
+            # Scenario render: preserve user segment times, allow any B-roll count
+            rules = {
+                **BROLL_RULES,
+                "max_inserts": max(20, len(broll_ids)),
+                "min_duration": 0.5,
+                "max_duration": 120,
+            }
+            tasks = validate_and_fix_plan(tasks, rules)
+    else:
+        tasks = scenario_to_render_tasks(
+            scenario, overlay_style, source_path, broll_registry, main_asset_id
+        )
 
     initial_registry = {"source": source_path}
     initial_registry.update(broll_registry)

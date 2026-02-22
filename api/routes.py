@@ -420,6 +420,8 @@ async def fetch_stock_for_segment(
         main_asset = next((a for a in assets if a.type == "video"), assets[0] if assets else None)
         if not main_asset:
             raise HTTPException(400, "No video asset in project")
+        main_asset_id = main_asset.id
+        main_asset_file_key = main_asset.file_key
 
     video_layer = next((l for l in scenario.layers if l.type == "video"), None)
     if not video_layer:
@@ -449,7 +451,7 @@ async def fetch_stock_for_segment(
         raise HTTPException(400, "No search query. Provide query in request body or in segment/scene.")
 
     storage = get_storage()
-    source_path = storage.get_asset_path(main_asset.file_key)
+    source_path = storage.get_asset_path(main_asset_file_key)
     import subprocess
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -510,10 +512,9 @@ async def fetch_stock_for_segment(
         sc.data = scenario.model_dump()
         sc.version += 1
         db.commit()
-        db.refresh(sc)
         scenario = Scenario.model_validate(sc.data)
 
-    return ensure_audio_layer(scenario, main_asset.id)
+    return ensure_audio_layer(scenario, main_asset_id)
 
 
 class GenerateVeoRequest(BaseModel):
@@ -654,6 +655,7 @@ async def _do_generate_veo(project_id: str, segment_id: str, body: GenerateVeoRe
 
 class RenderScenarioRequest(BaseModel):
     overlay_style: str = "minimal"
+    render_mode: str = "C"  # A: LLM→tasks, B: LLM+валидация, C: Python+проверка
 
 
 class RenderScenarioResponse(BaseModel):
@@ -689,6 +691,7 @@ async def scenario_render(project_id: str, body: RenderScenarioRequest):
             scenario=scenario,
             assets=asset_dicts,
             overlay_style=body.overlay_style or "minimal",
+            render_mode=body.render_mode or "C",
             storage=storage,
         )
 

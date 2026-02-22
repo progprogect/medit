@@ -68,9 +68,10 @@ const scenesView = document.getElementById("scenesView");
 const timelineView = document.getElementById("timelineView");
 const viewTabs = document.querySelectorAll(".view-tab");
 const overlayStyleSelect = document.getElementById("overlayStyleSelect");
-const renderScenarioBtn = document.getElementById("renderScenarioBtn");
+const renderModeBtns = document.querySelectorAll(".render-mode-btn");
 const renderProgress = document.getElementById("renderProgress");
 const renderResult = document.getElementById("renderResult");
+const renderPreview = document.getElementById("renderPreview");
 const renderDownload = document.getElementById("renderDownload");
 const renderHint = document.getElementById("renderHint");
 
@@ -648,7 +649,7 @@ function hasMainVideo(scenario) {
 }
 
 async function renderScenarioUI(scenario) {
-  if (!overlayStyleSelect || !renderScenarioBtn) return;
+  if (!overlayStyleSelect || !renderModeBtns.length) return;
   try {
     const res = await fetch(`/api/projects/${currentProjectId}/overlay-styles`);
     const data = res.ok ? await res.json() : {};
@@ -668,7 +669,7 @@ async function renderScenarioUI(scenario) {
     overlayStyleSelect.innerHTML = '<option value="minimal">Минимальный</option>';
   }
   const canRender = !!(currentProjectId && scenario && hasMainVideo(scenario));
-  renderScenarioBtn.disabled = !canRender;
+  renderModeBtns.forEach((btn) => { btn.disabled = !canRender; });
   if (renderHint) {
     renderHint.classList.toggle("hidden", canRender);
     renderHint.textContent = canRender
@@ -678,19 +679,21 @@ async function renderScenarioUI(scenario) {
   if (renderResult) renderResult.classList.add("hidden");
 }
 
-if (renderScenarioBtn) {
-  renderScenarioBtn.addEventListener("click", async () => {
+renderModeBtns.forEach((btn) => {
+  btn.addEventListener("click", async () => {
     if (!currentProjectId || !currentScenario) return;
     const style = overlayStyleSelect?.value || "minimal";
+    const mode = btn.dataset.mode || "C";
     hideError();
-    renderScenarioBtn.disabled = true;
+    renderModeBtns.forEach((b) => { b.disabled = true; });
     if (renderProgress) renderProgress.classList.remove("hidden");
     if (renderResult) renderResult.classList.add("hidden");
+    if (renderPreview) renderPreview.removeAttribute("src");
     try {
       const res = await fetch(`/api/projects/${currentProjectId}/scenario/render`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ overlay_style: style }),
+        body: JSON.stringify({ overlay_style: style, render_mode: mode }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -699,9 +702,13 @@ if (renderScenarioBtn) {
         throw new Error(msg);
       }
       const data = await res.json();
+      const fullUrl = data.download_url.startsWith("/") ? window.location.origin + data.download_url : data.download_url;
+      if (renderPreview) {
+        renderPreview.src = fullUrl;
+        renderPreview.classList.remove("hidden");
+      }
       if (renderDownload) {
-        const url = data.download_url;
-        renderDownload.href = url.startsWith("/") ? window.location.origin + url : url;
+        renderDownload.href = fullUrl;
         renderDownload.download = "result.mp4";
         renderDownload.classList.remove("hidden");
       }
@@ -712,10 +719,11 @@ if (renderScenarioBtn) {
       showError(err.message || "Ошибка рендеринга");
       if (renderProgress) renderProgress.classList.add("hidden");
     } finally {
-      renderScenarioBtn.disabled = !hasMainVideo(currentScenario);
+      const canRender = hasMainVideo(currentScenario);
+      renderModeBtns.forEach((b) => { b.disabled = !canRender; });
     }
   });
-}
+});
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
 dropzone.addEventListener("click", () => fileInput.click());

@@ -84,12 +84,15 @@
           <select id="overlayStyleSelect"></select>
           <p id="renderHint" class="render-hint hidden"></p>
           <div class="render-actions">
-            <button id="renderScenarioBtn" class="btn btn-primary" disabled>Сгенерировать видео</button>
+            <button id="renderBtnA" class="btn btn-primary render-mode-btn" data-mode="A" disabled title="LLM получает сценарий + ассеты и возвращает tasks">A: LLM → tasks</button>
+            <button id="renderBtnB" class="btn btn-primary render-mode-btn" data-mode="B" disabled title="LLM генерирует задачи + Python-валидация">B: LLM + валидация</button>
+            <button id="renderBtnC" class="btn btn-primary render-mode-btn" data-mode="C" disabled title="Детерминированный scenario_to_render_tasks + проверка готовности">C: Python + проверка</button>
           </div>
           <div id="renderProgress" class="scan-progress hidden">
             <p class="scan-eta">Рендеринг… 30–120 сек</p>
           </div>
           <div id="renderResult" class="render-result hidden">
+            <video id="renderPreview" controls playsinline class="render-preview"></video>
             <a id="renderDownload" class="btn btn-secondary" download>Скачать видео</a>
           </div>
         </section>

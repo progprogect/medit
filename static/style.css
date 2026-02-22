@@ -727,10 +727,28 @@ textarea:focus {
 
 .render-actions {
   margin-top: var(--space-sm);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+}
+
+.render-mode-btn {
+  font-size: 0.9rem;
+  padding: 8px 14px;
 }
 
 .render-result {
   margin-top: var(--space-md);
+}
+
+.render-preview {
+  display: block;
+  width: 100%;
+  max-width: 640px;
+  max-height: 360px;
+  border-radius: var(--radius-md);
+  background: #000;
+  margin-bottom: var(--space-sm);
 }
 
 .create-upload h2, .create-prompt h2 {

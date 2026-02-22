@@ -97,6 +97,27 @@ RULES:
 - visual_description: start with "STOCK CLIP:" or "TALKING HEAD:" or describe original content.
 - Overlays must not overlap; each 2-4 seconds."""
 
+# ─── Scenario to tasks (Create Scenario render) ───────────────────────────────────
+SCENARIO_TO_TASKS_INSTRUCTION = """You are a video editor. You receive a scenario (JSON) with scenes, layers, segments, and overlays.
+Your job: generate FFmpeg tasks to render this scenario to video.
+
+INPUT:
+- scenario: scenes, layers (video/audio/text), segments with start_sec/end_sec, asset_id
+- broll_ids: list of available B-roll clip IDs (e.g. ["broll_1", "broll_2"]) — use these EXACT ids in overlay_video
+- overlay_style: minimal | box_dark | box_light | outline | bold_center
+
+OUTPUT: JSON with "tasks" array. Each task: { "type": "...", "params": {...} }
+
+TASK TYPES:
+1. overlay_video — for each B-roll segment (non-main video). params: start_time, end_time, stock_id (must be one of broll_ids)
+2. add_text_overlay — for each text overlay in scenes. params: text, position, start_time, end_time, font_size, font_color, shadow, background
+
+RULES:
+- Do NOT generate fetch_stock_video — B-roll clips are already provided.
+- overlay_video: stock_id MUST be one of the given broll_ids. Match by segment order: 1st B-roll segment → broll_1, 2nd → broll_2, etc.
+- add_text_overlay: position = center|top_center|bottom_center|top_left|top_right|bottom_left|bottom_right
+- Return ONLY valid JSON. No markdown."""
+
 # ─── Refine scenario ────────────────────────────────────────────────────────────
 REFINE_INSTRUCTION = """You are a video editor. You receive:
 1. A current scenario (JSON with metadata, scenes, layers).
@@ -723,6 +744,68 @@ def analyze_and_generate_tasks(video_path: Path, user_prompt: str) -> list[dict]
     """Legacy: analyze and return tasks only."""
     plan = analyze_and_generate_plan(video_path, user_prompt)
     return plan["tasks"]
+
+
+def scenario_to_llm_tasks(
+    scenario: Scenario,
+    overlay_style: str,
+    broll_ids: list[str],
+    model: str = "gemini-2.5-flash",
+) -> list[dict]:
+    """
+    Generate FFmpeg tasks from scenario using LLM.
+    Used for render modes A and B. B-roll clips already in registry (broll_1, broll_2, ...).
+    """
+    api_key = get_gemini_api_key()
+    client = genai.Client(api_key=api_key)
+
+    scenario_json = json.dumps(scenario.model_dump(), ensure_ascii=False, indent=2)
+    prompt = (
+        f"SCENARIO:\n{scenario_json}\n\n"
+        f"BROLL_IDS (use these exact stock_id values in overlay_video): {json.dumps(broll_ids)}\n\n"
+        f"OVERLAY_STYLE: {overlay_style}\n\n"
+        "Return JSON: { \"scenario_name\": \"...\", \"scenario_description\": \"...\", \"metadata\": {{}}, \"tasks\": [...] }"
+    )
+
+    logger.info("Gemini: scenario_to_llm_tasks (model=%s)...", model)
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config={
+            "system_instruction": SCENARIO_TO_TASKS_INSTRUCTION,
+            "response_mime_type": "application/json",
+        },
+    )
+
+    if not response.text:
+        raise ValueError("Empty response from Gemini")
+
+    try:
+        data = json.loads(response.text)
+    except json.JSONDecodeError as e:
+        logger.error("Gemini: JSON parse error: %s\nResponse: %s", e, response.text[:500])
+        raise ValueError(f"Cannot parse Gemini response as JSON: {e}") from e
+
+    data = _normalize_gemini_response(data)
+    validated = PlanResponse.model_validate(data)
+
+    tasks = []
+    for t in validated.tasks:
+        if not t.params and t.inputs is None:
+            continue
+        task_dict: dict = {"type": t.type, "params": t.params}
+        if t.output_id is not None:
+            task_dict["output_id"] = t.output_id
+        if t.inputs is not None:
+            task_dict["inputs"] = t.inputs
+        tasks.append(task_dict)
+
+    # Filter: only overlay_video and add_text_overlay (no fetch_stock)
+    allowed = {"overlay_video", "add_text_overlay"}
+    tasks = [t for t in tasks if t["type"] in allowed]
+
+    logger.info("Gemini: scenario_to_llm_tasks returned %d tasks", len(tasks))
+    return tasks
 
 
 def scan_broll_suggestions(
