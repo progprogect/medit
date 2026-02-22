@@ -1,6 +1,7 @@
-"""Render scenario to final video: trim, overlay, concat."""
+"""Render scenario to final video: full video + B-roll overlays + text overlays."""
 
 import logging
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -78,48 +79,34 @@ def get_overlay_styles() -> list[dict[str, str]]:
     return [{"id": k, "label": labels.get(k, k)} for k in OVERLAY_PRESETS]
 
 
-def _get_scene_by_id(scenario: Scenario, scene_id: str | None):
-    """Get scene by id (Scene model or dict)."""
-    if not scene_id:
-        return None
-    for s in scenario.scenes:
-        sid = s.id if hasattr(s, "id") else s.get("id")
-        if sid == scene_id:
-            return s
-    return None
-
-
-def _overlays_for_segment(
-    scenario: Scenario, segment: Segment
-) -> list[Overlay]:
-    """Get overlays from scene that fall within segment time range."""
-    scene = _get_scene_by_id(scenario, segment.scene_id)
-    if not scene:
-        return []
-    overlays_raw = scene.overlays if hasattr(scene, "overlays") else scene.get("overlays", [])
-    result = []
-    for o in overlays_raw:
-        ov = Overlay(**o) if isinstance(o, dict) else o
-        # Overlay must overlap with segment
-        if ov.end_sec <= segment.start_sec or ov.start_sec >= segment.end_sec:
-            continue
-        result.append(ov)
-    return result
+def _get_video_size(path: Path) -> tuple[int, int]:
+    """Return (width, height) via ffprobe."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return 1080, 1920
+    lines = r.stdout.strip().splitlines()
+    try:
+        return int(lines[0]), int(lines[1])
+    except (ValueError, IndexError):
+        return 1080, 1920
 
 
 def _overlay_to_task_params(
     overlay: Overlay,
-    segment_start: float,
     preset: dict[str, Any],
 ) -> dict[str, Any]:
-    """Convert overlay to add_text_overlay task params with preset style."""
-    # Times relative to segment start (trimmed clip)
-    start_time = max(0, overlay.start_sec - segment_start)
-    end_time = overlay.end_sec - segment_start
+    """Convert overlay to add_text_overlay task params (absolute times)."""
+    start_time = overlay.start_sec
+    end_time = overlay.end_sec
     if end_time <= start_time:
         end_time = start_time + 1
 
-    params = {
+    return {
         "text": overlay.text,
         "position": overlay.position or "center",
         "start_time": start_time,
@@ -131,18 +118,18 @@ def _overlay_to_task_params(
         "border_width": preset.get("border_width", 0),
         "border_color": preset.get("border_color"),
     }
-    return params
 
 
 def scenario_to_render_tasks(
     scenario: Scenario,
     overlay_style: str,
     source_path: Path,
-) -> tuple[list[dict], dict[str, Path]]:
+    broll_registry: dict[str, Path],
+    main_asset_id: str | None = None,
+) -> list[dict]:
     """
-    Build executor tasks for rendering scenario.
-    Returns (tasks, initial_registry).
-    Raises RenderBlocked if any segment is not ready.
+    Build executor tasks: overlay_video for B-roll, add_text_overlay for text.
+    Full video as base, audio preserved. B-roll overlays replace picture at slots.
     """
     preset = OVERLAY_PRESETS.get(overlay_style, OVERLAY_PRESETS["minimal"])
 
@@ -152,64 +139,48 @@ def scenario_to_render_tasks(
     if not video_layer or not video_layer.segments:
         raise ValueError("Scenario has no video segments")
 
+    def _is_broll(seg: Segment) -> bool:
+        if (seg.asset_source or "uploaded") == "generated" or (seg.asset_status or "ready") == "pending":
+            return True
+        if (seg.asset_source or "uploaded") == "uploaded" and (seg.asset_status or "ready") == "ready":
+            return bool(seg.asset_id and main_asset_id and seg.asset_id != main_asset_id)
+        return False
+
     segments = sorted(video_layer.segments, key=lambda s: s.start_sec)
-    blocked: list[str] = []
-
-    for seg in segments:
-        status = seg.asset_status or "ready"
-        source = seg.asset_source or "uploaded"
-        # MVP: only uploaded segments
-        if status != "ready" or source != "uploaded":
-            blocked.append(seg.id)
-
-    if blocked:
-        raise RenderBlocked(
-            f"Segments need video: {', '.join(blocked)}. Generate or upload first.",
-            segment_ids=blocked,
-        )
-
     tasks: list[dict] = []
-    segment_output_ids: list[str] = []
+    broll_idx = 0
 
-    for i, seg in enumerate(segments):
-        seg_out_id = f"seg_{i}"
-        segment_output_ids.append(seg_out_id)
+    # 1. overlay_video for each B-roll segment
+    for seg in segments:
+        if not _is_broll(seg):
+            continue
+        oid = f"broll_{broll_idx + 1}"
+        if oid not in broll_registry:
+            logger.warning("Render: B-roll segment %s has no clip (oid=%s), skip", seg.id, oid)
+            continue
+        tasks.append({
+            "type": "overlay_video",
+            "params": {
+                "start_time": seg.start_sec,
+                "end_time": seg.end_sec,
+                "stock_id": oid,
+            },
+        })
+        broll_idx += 1
 
-        # 1. Trim
-        trim_task = {
-            "type": "trim",
-            "params": {"start": seg.start_sec, "end": seg.end_sec},
-            "output_id": seg_out_id,
-            "inputs": ["source"],
-        }
-        tasks.append(trim_task)
-
-        # 2. Overlays (chain on trim output)
-        overlays = _overlays_for_segment(scenario, seg)
-        prev_id = seg_out_id
-        for ov in overlays:
-            if not ov.text.strip():
+    # 2. add_text_overlay for each overlay (from all scenes)
+    for scene in scenario.scenes:
+        for ov in scene.overlays if hasattr(scene, "overlays") else scene.get("overlays", []):
+            o = Overlay(**ov) if isinstance(ov, dict) else ov
+            if not o.text.strip():
                 continue
-            ov_params = _overlay_to_task_params(ov, seg.start_sec, preset)
-            overlay_task = {
+            params = _overlay_to_task_params(o, preset)
+            tasks.append({
                 "type": "add_text_overlay",
-                "params": ov_params,
-                "output_id": seg_out_id,
-                "inputs": [prev_id],
-            }
-            tasks.append(overlay_task)
-            prev_id = seg_out_id
+                "params": params,
+            })
 
-    # 3. Concat all segments
-    concat_task = {
-        "type": "concat",
-        "params": {},
-        "inputs": segment_output_ids,
-    }
-    tasks.append(concat_task)
-
-    initial_registry = {"source": source_path}
-    return tasks, initial_registry
+    return tasks
 
 
 def render_scenario(
@@ -220,9 +191,10 @@ def render_scenario(
     storage: Storage,
 ) -> str:
     """
-    Render scenario to video. Returns output_key for download.
+    Render scenario to video.
+    Full main video + B-roll overlays (at slots) + text overlays.
+    Audio from main video throughout.
     """
-    # Main asset: first video (same as scenario generation)
     main_asset = None
     for a in assets:
         if a.get("type") == "video":
@@ -234,15 +206,105 @@ def render_scenario(
         raise ValueError("No video asset for rendering")
 
     source_path = storage.get_asset_path(main_asset["file_key"])
+    w, h = _get_video_size(source_path)
+    orientation = "portrait" if h > w else "landscape"
+    max_width = min(w, h, 1920) if h > w else min(w, 1920)
+    dest_dir = storage.output_dir
 
-    tasks, initial_registry = scenario_to_render_tasks(
-        scenario, overlay_style, source_path
+    # Build asset lookup
+    assets_by_id = {a.get("id"): a for a in assets if a.get("id")}
+    main_asset_id = main_asset.get("id")
+
+    # Fetch B-roll for B-roll segments (not main video). Main = asset_id == main_asset_id.
+    video_layer = next((l for l in scenario.layers if l.type == "video"), None)
+    broll_registry: dict[str, Path] = {}
+    broll_idx = 0
+
+    def _is_broll_segment(seg: Segment) -> bool:
+        """B-roll slot: generated/pending, or pre-fetched (uploaded+ready but asset_id != main)."""
+        if (seg.asset_source or "uploaded") == "generated" or (seg.asset_status or "ready") == "pending":
+            return True
+        if (seg.asset_source or "uploaded") == "uploaded" and (seg.asset_status or "ready") == "ready":
+            return seg.asset_id and seg.asset_id != main_asset_id  # pre-fetched stock
+        return False
+
+    def _get_broll_query(seg: Segment) -> str:
+        """Resolve stock query from segment.params, scene.generation_tasks, or scene.visual_description."""
+        q = (seg.params or {}).get("query", "")
+        if q:
+            return q
+        if not seg.scene_id:
+            return "professional b-roll"
+        scene = next((s for s in scenario.scenes if s.id == seg.scene_id), None)
+        if not scene:
+            return "professional b-roll"
+        for gt in getattr(scene, "generation_tasks", []) or []:
+            g = gt if hasattr(gt, "params") else (gt or {})
+            sid = getattr(gt, "segment_id", None) or (g.get("segment_id") if isinstance(g, dict) else None)
+            if sid == seg.id:
+                params = getattr(g, "params", None) or (g.get("params") if isinstance(g, dict) else {}) or {}
+                q = params.get("query", "")
+                if q:
+                    return q
+        # Fallback: use visual_description or generic
+        desc = getattr(scene, "visual_description", None) or ""
+        if desc and len(desc) > 3:
+            return desc[:80]
+        return "professional b-roll"
+
+    if video_layer:
+        from services.stock import fetch_stock_media
+
+        for seg in sorted(video_layer.segments, key=lambda s: s.start_sec):
+            if not _is_broll_segment(seg):
+                continue  # Main video segment, not B-roll
+            oid = f"broll_{broll_idx + 1}"
+            media_path = None
+            # Use pre-fetched asset if available
+            if seg.asset_status == "ready" and seg.asset_id:
+                a = assets_by_id.get(seg.asset_id)
+                if a and a.get("file_key"):
+                    try:
+                        media_path = storage.get_asset_path(a["file_key"])
+                    except Exception:
+                        pass
+            # Otherwise fetch from stock
+            if not media_path or not media_path.exists():
+                query = _get_broll_query(seg)
+                if not query:
+                    logger.warning("Render: B-roll segment %s has no query and no asset, skip", seg.id)
+                    continue
+                duration = max(5, int(seg.end_sec - seg.start_sec) + 2)
+                media_path = fetch_stock_media(
+                    query=query,
+                    media_type="video",
+                    dest_dir=dest_dir,
+                    duration_max=duration,
+                    orientation=orientation,
+                    max_width=max_width,
+                )
+            if media_path and media_path.exists():
+                broll_registry[oid] = media_path
+                broll_idx += 1
+        logger.info("Render: %d B-roll clips (pre-fetched or from stock)", len(broll_registry))
+
+    tasks = scenario_to_render_tasks(
+        scenario, overlay_style, source_path, broll_registry, main_asset_id
     )
+
+    initial_registry = {"source": source_path}
+    initial_registry.update(broll_registry)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
         temp_out = Path(tf.name)
     try:
-        logger.info("Render: %d tasks for project %s", len(tasks), project_id)
+        logger.info(
+            "Render: project=%s tasks=%d (overlay_video=%d add_text_overlay=%d)",
+            project_id,
+            len(tasks),
+            sum(1 for t in tasks if t.get("type") == "overlay_video"),
+            sum(1 for t in tasks if t.get("type") == "add_text_overlay"),
+        )
         run_tasks(
             input_path=source_path,
             tasks=tasks,

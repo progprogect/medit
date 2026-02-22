@@ -43,7 +43,13 @@ def _position_to_drawtext(position: str, margin: int = 50) -> str:
 
 
 def _escape_drawtext(s: str) -> str:
-    return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    """Escape for FFmpeg drawtext: \\ : ' % (order matters)."""
+    return (
+        s.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+    )
 
 
 def _is_image_file(path: Path) -> bool:
@@ -150,16 +156,23 @@ def _build_drawtext(
     shadow: bool,
     border_color: str | None,
     border_width: int,
+    textfile_path: Path | None = None,
 ) -> str:
-    """Assemble FFmpeg drawtext filter string with optional styling."""
-    escaped = _escape_drawtext(text)
+    """Assemble FFmpeg drawtext filter. Use textfile_path to avoid escaping issues."""
     parts = [
         f"drawtext=fontfile='{font}'",
-        f"text='{escaped}'",
+        "expansion=none",
         f"fontsize={font_size}",
         f"fontcolor={font_color}",
         pos_expr,
     ]
+    if textfile_path:
+        # textfile avoids all escaping; path must be escaped for filter
+        path_str = str(textfile_path).replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        parts.append(f"textfile='{path_str}'")
+    else:
+        escaped = _escape_drawtext(text)
+        parts.append(f"text='{escaped}'")
 
     if shadow:
         parts += ["shadowx=2", "shadowy=2", "shadowcolor=black@0.8"]
@@ -277,6 +290,9 @@ def run_tasks(
         if task_type == "add_text_overlay":
             src = _resolve_input(task)
             text = params.get("text", "")
+            if not text or not str(text).strip():
+                logger.warning("Executor: add_text_overlay с пустым text, пропуск")
+                continue
             font_size = params.get("font_size", 48)
             font_color = params.get("font_color", "white")
             start_time = params.get("start_time")
@@ -302,25 +318,36 @@ def run_tasks(
                 position = params.get("position", "bottom_center")
                 pos_expr = _position_to_drawtext(position, margin)
 
-            drawtext = _build_drawtext(
-                font=font,
-                text=text,
-                font_size=font_size,
-                font_color=font_color,
-                pos_expr=pos_expr,
-                start_time=start_time,
-                end_time=end_time,
-                background=background,
-                shadow=shadow,
-                border_color=border_color,
-                border_width=border_width,
-            )
+            # Use textfile to avoid FFmpeg escaping issues with : ' % etc.
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, encoding="utf-8"
+            ) as tf:
+                tf.write(text)
+                text_path = Path(tf.name)
+            try:
+                drawtext = _build_drawtext(
+                    font=font,
+                    text=text,
+                    font_size=font_size,
+                    font_color=font_color,
+                    pos_expr=pos_expr,
+                    start_time=start_time,
+                    end_time=end_time,
+                    background=background,
+                    shadow=shadow,
+                    border_color=border_color,
+                    border_width=border_width,
+                    textfile_path=text_path,
+                )
 
-            out = _temp_path(output_path, "step_text", ".mp4")
-            _ffmpeg_run(
-                ["ffmpeg", "-y", "-i", str(src), "-vf", drawtext, "-c:a", "copy", str(out)],
-                "add_text_overlay",
-            )
+                out = _temp_path(output_path, "step_text", ".mp4")
+                _ffmpeg_run(
+                    ["ffmpeg", "-y", "-i", str(src), "-vf", drawtext,
+                     "-map", "0:v", "-map", "0:a?", "-c:a", "copy", str(out)],
+                    "add_text_overlay",
+                )
+            finally:
+                text_path.unlink(missing_ok=True)
             temp_paths.append(out)
             _register(task, out)
             logger.info("Executor: add_text_overlay за %.1f сек", time.time() - t0)
@@ -581,11 +608,12 @@ def run_tasks(
             )
 
             out = _temp_path(output_path, "step_broll", ".mp4")
+            # 0:a? = optional audio (source may have no audio, e.g. some MOV from phone)
             _ffmpeg_run(
                 ["ffmpeg", "-y",
                  "-i", str(src), "-i", str(overlay_path),
                  "-filter_complex", filter_cx,
-                 "-map", "[v]", "-map", "0:a",
+                 "-map", "[v]", "-map", "0:a?",
                  "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy",
                  str(out)],
                 "overlay_video",

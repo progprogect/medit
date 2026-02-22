@@ -66,7 +66,7 @@ NEVER mix params between task types. Generate ONLY valid JSON. No markdown."""
 
 # ─── Simple scenario (no transcription, no ffmpeg) ─────────────────────────────
 SCENARIO_SIMPLE_INSTRUCTION = """You are a video editor. You receive a video and a user prompt.
-Analyze the video visually and generate a scenario with text overlays.
+Analyze the video visually and generate a scenario. The video can mix: original footage, STOCK CLIPs (from Pexels), TALKING HEAD (from original).
 
 Return ONLY valid JSON (no markdown) with this structure:
 {
@@ -79,8 +79,10 @@ Return ONLY valid JSON (no markdown) with this structure:
   "scenes": [{
     "id": "scene_0",
     "start_sec": 0,
-    "end_sec": <total_duration_sec>,
-    "visual_description": "what happens in the video",
+    "end_sec": <number>,
+    "visual_description": "what happens — use 'STOCK CLIP:' or 'TALKING HEAD:' or 'original video' prefix",
+    "asset_source": "uploaded" | "generated",
+    "stock_query": "search query for Pexels (only if asset_source=generated)",
     "overlays": [
       {"text": "overlay text", "position": "center|bottom|top", "start_sec": 2.0, "end_sec": 5.0},
       ...
@@ -89,11 +91,11 @@ Return ONLY valid JSON (no markdown) with this structure:
 }
 
 RULES:
-- Add text overlays ONLY when user explicitly requests them. Otherwise return overlays: [].
-- If user requests content at the end of the video — add a second scene or describe the stock clip to fetch based on the request.
-- position: "center", "bottom", or "top"
-- Overlays must not overlap; each 2-4 seconds
-- Match overlay content to user prompt when overlays are requested"""
+- asset_source: "uploaded" = use original video, "generated" = need stock clip (Pexels) or AI generation.
+- For scenes with stock/B-roll: set asset_source="generated", stock_query="short English search phrase" (e.g. "engineers soldering circuit board").
+- For scenes from original video (screen recording, talking head): asset_source="uploaded".
+- visual_description: start with "STOCK CLIP:" or "TALKING HEAD:" or describe original content.
+- Overlays must not overlap; each 2-4 seconds."""
 
 # ─── Refine scenario ────────────────────────────────────────────────────────────
 REFINE_INSTRUCTION = """You are a video editor. You receive:

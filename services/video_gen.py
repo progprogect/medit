@@ -41,7 +41,6 @@ def generate_video_clip(
                 aspect_ratio=aspect_ratio,
                 number_of_videos=1,
                 negative_prompt=negative_prompt,
-                generate_audio=False,
             ),
         )
 

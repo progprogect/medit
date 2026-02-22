@@ -6,7 +6,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 from fastapi.responses import FileResponse
@@ -20,6 +20,27 @@ from services.storage import get_storage
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="AI Video Editing")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Avoid 404 when browser requests favicon.ico."""
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Return 500 with actual error message for debugging."""
+    if isinstance(exc, HTTPException):
+        raise exc
+    logger.exception("Unhandled exception: %s", exc)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc) or "Internal Server Error"},
+    )
+
 
 app.include_router(api_router, prefix="/api")
 

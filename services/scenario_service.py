@@ -182,17 +182,87 @@ def normalize_llm_scenario(raw: dict) -> Scenario:
             )
         )
 
-    return Scenario(
+    scenario = Scenario(
         version=int(raw.get("version", 1)),
         metadata=meta,
         scenes=scenes,
         layers=layers,
     )
+    _infer_stock_from_scenes(scenario)
+    return scenario
+
+
+def _infer_stock_from_scenes(scenario: Scenario) -> None:
+    """Set asset_source=generated for segments whose scene has STOCK in visual_description."""
+    video_layer = next((l for l in scenario.layers if l.type == "video"), None)
+    if not video_layer:
+        return
+    for seg in video_layer.segments:
+        scene = next((s for s in scenario.scenes if s.id == seg.scene_id), None)
+        if not scene:
+            scene = next((s for s in scenario.scenes if s.start_sec == seg.start_sec and s.end_sec == seg.end_sec), None)
+        if scene and (scene.visual_description or "").lower().find("stock") >= 0:
+            if (seg.asset_source or "uploaded") == "uploaded":
+                seg.asset_source = "generated"
+                seg.asset_status = "pending"
+                seg.asset_id = None
+                q = (seg.params or {}).get("query") or (scene.visual_description or "").replace("STOCK CLIP:", "").replace("STOCK:", "").strip()[:80]
+                seg.params = {"query": q}
 
 
 def is_tasks_format(raw: dict) -> bool:
     """Check if raw is in old tasks format (PlanResponse)."""
     return "tasks" in raw and "scenario_name" in raw
+
+
+def ensure_audio_layer(scenario: Scenario, main_asset_id: str | None = None) -> Scenario:
+    """
+    Ensure audio layer has one continuous segment 0..total_duration_sec.
+    Fixes hardcoded/short audio track in timeline.
+    """
+    total = scenario.metadata.total_duration_sec
+    video_layer = next((l for l in scenario.layers if l.type == "video"), None)
+    if video_layer and video_layer.segments:
+        max_seg = max(s.end_sec for s in video_layer.segments)
+        total = max(total or 0, max_seg)
+    if total is None or total <= 0:
+        total = 60.0
+
+    main_id = main_asset_id
+    if not main_id:
+        for layer in scenario.layers:
+            for seg in layer.segments or []:
+                if seg.asset_source == "uploaded" and seg.asset_id:
+                    main_id = seg.asset_id
+                    break
+            if main_id:
+                break
+
+    audio_layer = next((l for l in scenario.layers if l.type == "audio"), None)
+    audio_segment = Segment(
+        id="seg_audio_main",
+        start_sec=0,
+        end_sec=total,
+        asset_id=main_id,
+        asset_source="uploaded",
+        asset_status="ready",
+        scene_id=None,
+        params={},
+    )
+    if audio_layer:
+        audio_layer.segments = [audio_segment]
+    else:
+        scenario.layers.append(
+            Layer(
+                id="layer_audio_1",
+                type="audio",
+                order=len(scenario.layers),
+                segments=[audio_segment],
+            )
+        )
+    if scenario.metadata.total_duration_sec is None:
+        scenario.metadata.total_duration_sec = total
+    return scenario
 
 
 def scenario_for_render(scenario: Scenario, main_asset_id: str | None = None) -> Scenario:
@@ -244,10 +314,19 @@ def scenario_for_render(scenario: Scenario, main_asset_id: str | None = None) ->
     )
 
 
+def _infer_scene_asset_source(scene: Scene) -> tuple[str, str]:
+    """Infer asset_source and stock_query from scene.visual_description."""
+    vis = (scene.visual_description or "").lower()
+    if "stock clip" in vis or "stock" in vis or "stock footage" in vis:
+        q = (scene.visual_description or "").replace("STOCK CLIP:", "").replace("STOCK:", "").strip()[:80]
+        return "generated", q
+    return "uploaded", ""
+
+
 def ensure_video_layer_matches_scenes(scenario: Scenario, main_asset_id: str | None = None) -> Scenario:
     """
     Ensure video layer has one segment per scene (timeline shows separate parts).
-    Fixes scenarios where video was one combined segment.
+    Preserves STOCK CLIP segments when inferring from scene.visual_description.
     """
     scenes = sorted(scenario.scenes, key=lambda s: s.start_sec)
     if len(scenes) <= 1:
@@ -257,26 +336,44 @@ def ensure_video_layer_matches_scenes(scenario: Scenario, main_asset_id: str | N
     if not video_layer:
         return scenario
 
-    # If we already have one segment per scene, skip
-    if len(video_layer.segments) >= len(scenes):
-        return scenario
-
     main_id = main_asset_id
     if not main_id and video_layer.segments:
-        main_id = video_layer.segments[0].asset_id
+        for seg in video_layer.segments:
+            if seg.asset_source == "uploaded" and seg.asset_id:
+                main_id = seg.asset_id
+                break
+
+    if len(video_layer.segments) >= len(scenes):
+        segs_by_time = {s.start_sec: s for s in video_layer.segments}
+        for scene in scenes:
+            seg = next((s for s in video_layer.segments if s.scene_id == scene.id), None)
+            if not seg:
+                seg = next((s for s in video_layer.segments if s.start_sec == scene.start_sec and s.end_sec == scene.end_sec), None)
+            if seg and seg.asset_source == "uploaded" and (scene.visual_description or "").lower().find("stock") >= 0:
+                src, q = _infer_scene_asset_source(scene)
+                if src == "generated":
+                    seg.asset_source = "generated"
+                    seg.asset_status = "pending"
+                    seg.asset_id = None
+                    seg.params = {"query": q or seg.params.get("query", "")}
+        return scenario
 
     new_segments = []
     for i, scene in enumerate(scenes):
+        src, q = _infer_scene_asset_source(scene)
+        existing = next((s for s in video_layer.segments if s.scene_id == scene.id or (s.start_sec == scene.start_sec and s.end_sec == scene.end_sec)), None)
+        if existing and existing.asset_source == "generated":
+            src, q = "generated", existing.params.get("query", "") or q
         new_segments.append(
             Segment(
                 id=f"seg_video_{i}",
                 start_sec=scene.start_sec,
                 end_sec=scene.end_sec,
-                asset_id=main_id,
-                asset_source="uploaded",
-                asset_status="ready",
+                asset_id=main_id if src == "uploaded" else None,
+                asset_source=src,
+                asset_status="ready" if src == "uploaded" else "pending",
                 scene_id=scene.id,
-                params={},
+                params={"query": q} if src != "uploaded" else {},
             )
         )
 
@@ -353,21 +450,31 @@ def scenario_from_simple_output(
                     },
                 )
             )
+        vis_desc = s.get("visual_description") or ""
+        asset_source = s.get("asset_source")
+        stock_query = s.get("stock_query", "")
+        if asset_source is None:
+            vis_lower = vis_desc.lower()
+            if "stock clip" in vis_lower or "stock" in vis_lower or "stock footage" in vis_lower:
+                asset_source = "generated"
+                if not stock_query and vis_desc:
+                    stock_query = vis_desc.replace("STOCK CLIP:", "").replace("STOCK:", "").strip()[:80]
+            else:
+                asset_source = "uploaded"
         scenes.append(
             Scene(
                 id=scene_id,
                 start_sec=start_sec,
                 end_sec=end_sec,
-                visual_description=s.get("visual_description"),
+                visual_description=vis_desc,
                 voiceover_text=s.get("voiceover_text"),
                 overlays=overlays,
                 effects=s.get("effects", []),
                 transition=s.get("transition", "cut"),
                 asset_refs=[AssetRef(asset_id=main_asset_id, usage="main")],
-                generation_tasks=[],
+                generation_tasks=[GenerationTaskRef(task_type="fetch_stock_video", params={"query": stock_query}, segment_id=f"seg_video_{i}")] if asset_source == "generated" and stock_query else [],
             )
         )
-        asset_source = s.get("asset_source", "uploaded")
         video_segments.append(
             Segment(
                 id=f"seg_video_{i}",
@@ -377,7 +484,7 @@ def scenario_from_simple_output(
                 asset_source=asset_source,
                 asset_status="ready" if asset_source == "uploaded" else "pending",
                 scene_id=scene_id,
-                params={"query": s.get("stock_query", "")} if asset_source != "uploaded" else {},
+                params={"query": stock_query} if asset_source != "uploaded" else {},
             )
         )
     layers = [

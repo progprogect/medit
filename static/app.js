@@ -5,6 +5,7 @@ let currentSuggestions = [];
 let currentProjectId = null;
 let createAssets = [];
 let currentScenario = null;
+let projectAssets = [];
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const scanHint      = document.getElementById("scanHint");
@@ -82,6 +83,18 @@ function showError(msg) {
 
 function hideError() {
   errorEl.classList.add("hidden");
+}
+
+/** Parse API error response: detail can be string or array of validation errors. */
+function parseApiError(err, fallback) {
+  const d = err?.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d) && d.length) {
+    const first = d[0];
+    const msg = typeof first === "object" && first?.msg ? first.msg : String(first);
+    return msg || fallback;
+  }
+  return err?.message || fallback;
 }
 
 function escapeHtml(s) {
@@ -337,7 +350,7 @@ generateScenarioBtn.addEventListener("click", async () => {
     createProgress.classList.add("hidden");
     scenarioScreen.classList.remove("hidden");
     renderScenarioHeader(currentScenario);
-    renderScenesView(currentScenario);
+    await fetchAndRenderScenes(currentScenario);
     renderTimelineView(currentScenario);
     await renderScenarioUI(currentScenario);
   } catch (err) {
@@ -367,7 +380,7 @@ if (refineScenarioBtn && refinePrompt) {
       currentScenario = await res.json();
       refinePrompt.value = "";
       renderScenarioHeader(currentScenario);
-      renderScenesView(currentScenario);
+      await fetchAndRenderScenes(currentScenario);
       renderTimelineView(currentScenario);
       await renderScenarioUI(currentScenario);
     } catch (err) {
@@ -393,7 +406,13 @@ function renderTimelineView(scenario) {
   const totalSec = scenario.metadata?.total_duration_sec || 60;
   const pxPerSec = Math.max(4, Math.min(20, 400 / totalSec));
 
-  const layerLabels = { video: "Видео", image: "Изображения", text: "Текст", audio: "Аудио", subtitle: "Субтитры" };
+  const layerLabels = {
+    video: "Видео",
+    image: "Изображения",
+    text: "Текст",
+    audio: "Аудио (основное видео)",
+    subtitle: "Субтитры",
+  };
 
   timelineView.innerHTML = "";
   const wrap = document.createElement("div");
@@ -419,14 +438,26 @@ function renderTimelineView(scenario) {
     const track = document.createElement("div");
     track.className = "timeline-layer-track";
     track.style.width = totalSec * pxPerSec + "px";
-    (layer.segments || []).forEach((seg) => {
+    const segs = layer.segments || [];
+    if (layer.type === "audio" && segs.length === 0) {
+      const block = document.createElement("div");
+      block.className = "timeline-segment timeline-segment-uploaded";
+      block.style.width = Math.max(2, totalSec * pxPerSec) + "px";
+      block.style.left = "0px";
+      block.title = `0 – ${formatTime(totalSec)} (аудио основного видео)`;
+      track.appendChild(block);
+    }
+    segs.forEach((seg) => {
       const w = Math.max(2, (seg.end_sec - seg.start_sec) * pxPerSec);
       const left = seg.start_sec * pxPerSec;
       const block = document.createElement("div");
       block.className = `timeline-segment timeline-segment-${seg.asset_source || "uploaded"}`;
       block.style.width = w + "px";
       block.style.left = left + "px";
-      block.title = `${formatTime(seg.start_sec)} – ${formatTime(seg.end_sec)}${seg.params?.text ? ": " + seg.params.text : ""}`;
+      block.title =
+        layer.type === "audio"
+          ? `Аудио: ${formatTime(seg.start_sec)} – ${formatTime(seg.end_sec)}`
+          : `${formatTime(seg.start_sec)} – ${formatTime(seg.end_sec)}${seg.params?.text ? ": " + seg.params.text : ""}`;
       track.appendChild(block);
     });
     row.appendChild(track);
@@ -436,20 +467,59 @@ function renderTimelineView(scenario) {
   timelineView.appendChild(wrap);
 }
 
-function renderScenesView(scenario) {
+async function fetchAndRenderScenes(scenario) {
+  if (currentProjectId) {
+    try {
+      const r = await fetch(`/api/projects/${currentProjectId}/assets`);
+      if (r.ok) projectAssets = (await r.json()).assets || [];
+    } catch (_) { projectAssets = []; }
+  }
+  renderScenesView(scenario, projectAssets);
+}
+
+function renderScenesView(scenario, assets) {
   const scenes = scenario.scenes || [];
+  const videoLayer = (scenario.layers || []).find((l) => l.type === "video");
+  const videoSegments = videoLayer?.segments || [];
+  const totalSec = scenario.metadata?.total_duration_sec || 60;
+  const assetsById = (assets || projectAssets || []).reduce((acc, a) => { acc[a.id] = a; return acc; }, {});
   scenesView.innerHTML = "";
   scenes.forEach((scene, i) => {
     const card = document.createElement("div");
     card.className = "scene-card";
     const hasGen = (scene.generation_tasks || []).length > 0;
+    let seg = videoSegments.find((s) => s.scene_id === scene.id);
+    if (!seg) {
+      seg = videoSegments.find(
+        (s) =>
+          (s.start_sec <= scene.start_sec && s.end_sec >= scene.end_sec) ||
+          (s.start_sec < scene.end_sec && s.end_sec > scene.start_sec)
+      );
+    }
+    const needsMaterial =
+      seg && (seg.asset_status === "pending" || seg.asset_source === "generated");
+    const hasVideo = seg && (seg.asset_status === "ready" || seg.asset_source === "uploaded") && seg.asset_id;
+    const previewAsset = hasVideo && seg.asset_id ? assetsById[seg.asset_id] : null;
+    const previewUrl = previewAsset?.file_key ? `/files/uploads/${previewAsset.file_key}` : null;
+    const needsBroll = needsMaterial;
+    const query =
+      seg?.params?.query ||
+      (scene.generation_tasks || [])[0]?.params?.query ||
+      (scene.visual_description || "").slice(0, 80) ||
+      "";
     card.innerHTML = `
       <div class="scene-card-header">
-        <span>Сцена ${i + 1}</span>
-        <span class="scene-time">${formatTime(scene.start_sec)} – ${formatTime(scene.end_sec)}</span>
-        ${hasGen ? '<span class="scene-badge">needs AI</span>' : ""}
+        <div class="scene-header-left">
+          ${previewUrl ? `<video src="${previewUrl}" muted loop playsinline preload="metadata" class="scene-thumb"></video>` : ""}
+          <div class="scene-header-text">
+            <span>Сцена ${i + 1}</span>
+            <span class="scene-time">${formatTime(scene.start_sec)} – ${formatTime(scene.end_sec)}</span>
+          </div>
+        </div>
+        ${hasGen || needsBroll ? '<span class="scene-badge">B-roll</span>' : ""}
       </div>
       <div class="scene-card-body">
+        ${previewUrl ? `<div class="scene-preview"><video src="${previewUrl}" muted loop playsinline preload="metadata" class="scene-video-preview"></video></div>` : ""}
         ${scene.visual_description ? `<div class="scene-visual">${escapeHtml(scene.visual_description)}</div>` : ""}
         ${scene.voiceover_text ? `<div class="scene-voiceover">${escapeHtml(scene.voiceover_text)}</div>` : ""}
         ${(scene.overlays || []).length ? `
@@ -460,11 +530,101 @@ function renderScenesView(scenario) {
             </ul>
           </div>
         ` : ""}
+        ${needsMaterial ? `
+          <div class="scene-actions">
+            ${veoAvailable ? `
+              <button type="button" class="btn btn-primary btn-sm veo-btn" data-segment-id="${seg?.id || ""}" data-query="${escapeHtml(query)}" title="Генерация через VEO3">
+                Сгенерировать (VEO3)
+              </button>
+              <button type="button" class="btn btn-secondary btn-sm fetch-stock-btn" data-segment-id="${seg?.id || ""}" data-query="${escapeHtml(query)}" title="Альтернатива: поиск в Pexels">
+                Найти в стоке
+              </button>
+            ` : `
+              <button type="button" class="btn btn-primary btn-sm fetch-stock-btn" data-segment-id="${seg?.id || ""}" data-query="${escapeHtml(query)}" title="Поиск в Pexels">
+                Найти в стоке
+              </button>
+              <button type="button" class="btn btn-ghost btn-sm veo-btn" disabled title="VEO3 недоступен">
+                Сгенерировать (VEO3)
+              </button>
+            `}
+          </div>
+        ` : ""}
       </div>
     `;
     card.querySelector(".scene-card-header").addEventListener("click", () => {
       card.classList.toggle("expanded");
     });
+    const fetchBtn = card.querySelector(".fetch-stock-btn");
+    if (fetchBtn && seg) {
+      fetchBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const origText = fetchBtn.textContent;
+        fetchBtn.disabled = true;
+        fetchBtn.textContent = "Загрузка…";
+        try {
+          const res = await fetch(
+            `/api/projects/${currentProjectId}/scenario/segments/${seg.id}/fetch-stock`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ query: query || undefined }),
+            }
+          );
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || err.message || res.statusText);
+          }
+          currentScenario = await res.json();
+          await fetchAndRenderScenes(currentScenario);
+          renderTimelineView(currentScenario);
+          await renderScenarioUI(currentScenario);
+        } catch (err) {
+          showError(err.message || "Ошибка поиска в стоке");
+        } finally {
+          fetchBtn.disabled = false;
+          fetchBtn.textContent = origText;
+        }
+      });
+    }
+    const veoBtn = card.querySelector(".veo-btn:not([disabled])");
+    if (veoBtn && seg) {
+      veoBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        veoBtn.disabled = true;
+        veoBtn.textContent = "Генерация…";
+        const ctrl = new AbortController();
+        let timeoutId;
+        try {
+          timeoutId = setTimeout(() => ctrl.abort(), 3 * 60 * 1000);
+          const res = await fetch(
+            `/api/projects/${currentProjectId}/scenario/segments/${seg.id}/generate-veo`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ prompt: query || undefined }),
+              signal: ctrl.signal,
+            }
+          );
+          clearTimeout(timeoutId);
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(parseApiError(err, res.statusText));
+          }
+          currentScenario = await res.json();
+          await fetchAndRenderScenes(currentScenario);
+          renderTimelineView(currentScenario);
+          await renderScenarioUI(currentScenario);
+        } catch (err) {
+          clearTimeout(timeoutId);
+          const msg = err.name === "AbortError" ? "Генерация заняла слишком много времени (макс. 3 мин)" : (err.message || "Ошибка генерации VEO3");
+          showError(msg);
+        } finally {
+          clearTimeout(timeoutId);
+          veoBtn.disabled = false;
+          veoBtn.textContent = "Сгенерировать (VEO3)";
+        }
+      });
+    }
     scenesView.appendChild(card);
   });
 }
@@ -479,11 +639,11 @@ viewTabs.forEach(btn => {
   });
 });
 
-function allSegmentsReady(scenario) {
+function hasMainVideo(scenario) {
   const videoLayer = (scenario.layers || []).find((l) => l.type === "video");
-  if (!videoLayer || !videoLayer.segments) return true;
-  return videoLayer.segments.every(
-    (s) => (s.asset_status || "ready") === "ready" && (s.asset_source || "uploaded") === "uploaded"
+  if (!videoLayer || !videoLayer.segments) return false;
+  return videoLayer.segments.some(
+    (s) => (s.asset_source || "uploaded") === "uploaded" && (s.asset_status || "ready") === "ready"
   );
 }
 
@@ -507,11 +667,13 @@ async function renderScenarioUI(scenario) {
   } catch (_) {
     overlayStyleSelect.innerHTML = '<option value="minimal">Минимальный</option>';
   }
-  const canRender = allSegmentsReady(scenario);
+  const canRender = !!(currentProjectId && scenario && hasMainVideo(scenario));
   renderScenarioBtn.disabled = !canRender;
   if (renderHint) {
     renderHint.classList.toggle("hidden", canRender);
-    renderHint.textContent = canRender ? "" : "Сначала заполните все сегменты (MVP: только загруженное видео)";
+    renderHint.textContent = canRender
+      ? ""
+      : "Добавьте основное видео в проект. B-roll: нажмите «Сгенерировать (VEO3)» или «Найти в стоке» для сцены.";
   }
   if (renderResult) renderResult.classList.add("hidden");
 }
@@ -532,21 +694,25 @@ if (renderScenarioBtn) {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || err.message || res.statusText);
+        const msg = parseApiError(err, res.statusText);
+        console.error("Render API error:", res.status, err);
+        throw new Error(msg);
       }
       const data = await res.json();
       if (renderDownload) {
-        renderDownload.href = data.download_url;
+        const url = data.download_url;
+        renderDownload.href = url.startsWith("/") ? window.location.origin + url : url;
         renderDownload.download = "result.mp4";
         renderDownload.classList.remove("hidden");
       }
       if (renderResult) renderResult.classList.remove("hidden");
       if (renderProgress) renderProgress.classList.add("hidden");
     } catch (err) {
+      console.error("Render error:", err);
       showError(err.message || "Ошибка рендеринга");
       if (renderProgress) renderProgress.classList.add("hidden");
     } finally {
-      renderScenarioBtn.disabled = !allSegmentsReady(currentScenario);
+      renderScenarioBtn.disabled = !hasMainVideo(currentScenario);
     }
   });
 }
