@@ -66,6 +66,12 @@ const refineScenarioBtn = document.getElementById("refineScenarioBtn");
 const scenesView = document.getElementById("scenesView");
 const timelineView = document.getElementById("timelineView");
 const viewTabs = document.querySelectorAll(".view-tab");
+const overlayStyleSelect = document.getElementById("overlayStyleSelect");
+const renderScenarioBtn = document.getElementById("renderScenarioBtn");
+const renderProgress = document.getElementById("renderProgress");
+const renderResult = document.getElementById("renderResult");
+const renderDownload = document.getElementById("renderDownload");
+const renderHint = document.getElementById("renderHint");
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 function showError(msg) {
@@ -333,6 +339,7 @@ generateScenarioBtn.addEventListener("click", async () => {
     renderScenarioHeader(currentScenario);
     renderScenesView(currentScenario);
     renderTimelineView(currentScenario);
+    await renderScenarioUI(currentScenario);
   } catch (err) {
     createProgress.classList.add("hidden");
     createScenarioScreen.classList.remove("hidden");
@@ -362,6 +369,7 @@ if (refineScenarioBtn && refinePrompt) {
       renderScenarioHeader(currentScenario);
       renderScenesView(currentScenario);
       renderTimelineView(currentScenario);
+      await renderScenarioUI(currentScenario);
     } catch (err) {
       showError(err.message || "Ошибка доработки сценария");
     } finally {
@@ -470,6 +478,78 @@ viewTabs.forEach(btn => {
     timelineView.classList.toggle("hidden", isScenes);
   });
 });
+
+function allSegmentsReady(scenario) {
+  const videoLayer = (scenario.layers || []).find((l) => l.type === "video");
+  if (!videoLayer || !videoLayer.segments) return true;
+  return videoLayer.segments.every(
+    (s) => (s.asset_status || "ready") === "ready" && (s.asset_source || "uploaded") === "uploaded"
+  );
+}
+
+async function renderScenarioUI(scenario) {
+  if (!overlayStyleSelect || !renderScenarioBtn) return;
+  try {
+    const res = await fetch(`/api/projects/${currentProjectId}/overlay-styles`);
+    const data = res.ok ? await res.json() : {};
+    const styles = data.styles || [];
+    overlayStyleSelect.innerHTML = "";
+    if (styles.length) {
+      styles.forEach((s) => {
+        const opt = document.createElement("option");
+        opt.value = s.id;
+        opt.textContent = s.label;
+        overlayStyleSelect.appendChild(opt);
+      });
+    } else {
+      overlayStyleSelect.innerHTML = '<option value="minimal">Минимальный</option>';
+    }
+  } catch (_) {
+    overlayStyleSelect.innerHTML = '<option value="minimal">Минимальный</option>';
+  }
+  const canRender = allSegmentsReady(scenario);
+  renderScenarioBtn.disabled = !canRender;
+  if (renderHint) {
+    renderHint.classList.toggle("hidden", canRender);
+    renderHint.textContent = canRender ? "" : "Сначала заполните все сегменты (MVP: только загруженное видео)";
+  }
+  if (renderResult) renderResult.classList.add("hidden");
+}
+
+if (renderScenarioBtn) {
+  renderScenarioBtn.addEventListener("click", async () => {
+    if (!currentProjectId || !currentScenario) return;
+    const style = overlayStyleSelect?.value || "minimal";
+    hideError();
+    renderScenarioBtn.disabled = true;
+    if (renderProgress) renderProgress.classList.remove("hidden");
+    if (renderResult) renderResult.classList.add("hidden");
+    try {
+      const res = await fetch(`/api/projects/${currentProjectId}/scenario/render`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ overlay_style: style }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || err.message || res.statusText);
+      }
+      const data = await res.json();
+      if (renderDownload) {
+        renderDownload.href = data.download_url;
+        renderDownload.download = "result.mp4";
+        renderDownload.classList.remove("hidden");
+      }
+      if (renderResult) renderResult.classList.remove("hidden");
+      if (renderProgress) renderProgress.classList.add("hidden");
+    } catch (err) {
+      showError(err.message || "Ошибка рендеринга");
+      if (renderProgress) renderProgress.classList.add("hidden");
+    } finally {
+      renderScenarioBtn.disabled = !allSegmentsReady(currentScenario);
+    }
+  });
+}
 
 // ─── Upload ───────────────────────────────────────────────────────────────────
 dropzone.addEventListener("click", () => fileInput.click());

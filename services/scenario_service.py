@@ -195,6 +195,55 @@ def is_tasks_format(raw: dict) -> bool:
     return "tasks" in raw and "scenario_name" in raw
 
 
+def scenario_for_render(scenario: Scenario, main_asset_id: str | None = None) -> Scenario:
+    """
+    Prepare scenario for render: one segment per scene, all from main asset (uploaded).
+    Replaces B-roll/generated segments with trim from main video for MVP.
+    """
+    scenes = sorted(scenario.scenes, key=lambda s: s.start_sec)
+    video_layer = next((l for l in scenario.layers if l.type == "video"), None)
+    if not video_layer:
+        return scenario
+
+    main_id = main_asset_id
+    if not main_id and video_layer.segments:
+        for seg in video_layer.segments:
+            if seg.asset_source == "uploaded" and seg.asset_id:
+                main_id = seg.asset_id
+                break
+    if not main_id:
+        return scenario
+
+    new_segments = []
+    for i, scene in enumerate(scenes):
+        new_segments.append(
+            Segment(
+                id=f"seg_video_{i}",
+                start_sec=scene.start_sec,
+                end_sec=scene.end_sec,
+                asset_id=main_id,
+                asset_source="uploaded",
+                asset_status="ready",
+                scene_id=scene.id,
+                params={},
+            )
+        )
+
+    new_layers = []
+    for layer in scenario.layers:
+        if layer.type == "video":
+            new_layers.append(Layer(id=layer.id, type=layer.type, order=layer.order, segments=new_segments))
+        else:
+            new_layers.append(layer)
+
+    return Scenario(
+        version=scenario.version,
+        metadata=scenario.metadata,
+        scenes=scenario.scenes,
+        layers=new_layers,
+    )
+
+
 def ensure_video_layer_matches_scenes(scenario: Scenario, main_asset_id: str | None = None) -> Scenario:
     """
     Ensure video layer has one segment per scene (timeline shows separate parts).

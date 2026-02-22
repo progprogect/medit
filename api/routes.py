@@ -15,6 +15,7 @@ from db.session import get_db
 from schemas.scenario import Scenario
 from services.gemini import generate_scenario, refine_scenario
 from services.media_metadata import get_media_metadata
+from services.render_service import RenderBlocked, get_overlay_styles, render_scenario
 from services.storage import get_storage
 from services.transcriber import transcribe_audio
 
@@ -346,6 +347,67 @@ async def get_scenario(project_id: str):
         asset_ids = (scenario.metadata.asset_ids or []) if scenario.metadata else []
         main_id = asset_ids[0] if asset_ids else None
         return ensure_video_layer_matches_scenes(scenario, main_id)
+
+
+@router.get("/projects/{project_id}/overlay-styles")
+async def get_overlay_styles_endpoint(project_id: str):
+    """Get available overlay style presets for render."""
+    return {"styles": get_overlay_styles()}
+
+
+class RenderScenarioRequest(BaseModel):
+    overlay_style: str = "minimal"
+
+
+class RenderScenarioResponse(BaseModel):
+    output_key: str
+    download_url: str
+
+
+@router.post("/projects/{project_id}/scenario/render", response_model=RenderScenarioResponse)
+async def scenario_render(project_id: str, body: RenderScenarioRequest):
+    """Render scenario to video. MVP: only uploaded segments."""
+    from services.scenario_service import scenario_for_render
+
+    with get_db() as db:
+        sc = db.query(ScenarioModel).filter(ScenarioModel.project_id == project_id).first()
+        if not sc:
+            raise HTTPException(404, "Scenario not found")
+        scenario = Scenario.model_validate(sc.data)
+        assets = (
+            db.query(Asset)
+            .filter(Asset.project_id == project_id)
+            .order_by(Asset.order_index)
+            .all()
+        )
+        if not assets:
+            raise HTTPException(400, "No assets in project")
+        main_id = next((a.id for a in assets if a.type == "video"), assets[0].id)
+        scenario = scenario_for_render(scenario, main_id)
+        asset_dicts = [
+            {"id": a.id, "file_key": a.file_key, "type": a.type, "duration_sec": a.duration_sec}
+            for a in assets
+        ]
+    storage = get_storage()
+
+    def _render():
+        return render_scenario(
+            project_id=project_id,
+            scenario=scenario,
+            assets=asset_dicts,
+            overlay_style=body.overlay_style or "minimal",
+            storage=storage,
+        )
+
+    try:
+        output_key = await asyncio.to_thread(_render)
+    except RenderBlocked as e:
+        raise HTTPException(400, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    download_url = storage.get_download_url(output_key, is_output=True)
+    return RenderScenarioResponse(output_key=output_key, download_url=download_url)
 
 
 @router.put("/projects/{project_id}/scenario", response_model=Scenario)

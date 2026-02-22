@@ -690,6 +690,44 @@ textarea:focus {
   resize: vertical;
 }
 
+.scenario-render {
+  margin-top: var(--space-lg);
+  padding: var(--space-md);
+  background: var(--color-bg-muted);
+  border-radius: var(--radius-md);
+}
+
+.scenario-render label {
+  display: block;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #555;
+  margin-bottom: var(--space-sm);
+}
+
+.scenario-render select {
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  margin-bottom: var(--space-sm);
+  min-width: 180px;
+}
+
+.render-hint {
+  font-size: 0.85rem;
+  color: #888;
+  margin: 0 0 var(--space-sm);
+}
+
+.render-actions {
+  margin-top: var(--space-sm);
+}
+
+.render-result {
+  margin-top: var(--space-md);
+}
+
 .create-upload h2, .create-prompt h2 {
   font-size: 0.95rem;
   font-weight: 600;

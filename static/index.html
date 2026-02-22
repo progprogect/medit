@@ -78,6 +78,20 @@
         </div>
         <div id="scenesView" class="scenes-view"></div>
         <div id="timelineView" class="timeline-view hidden"></div>
+        <section class="scenario-render">
+          <label for="overlayStyleSelect">Стиль надписей:</label>
+          <select id="overlayStyleSelect"></select>
+          <p id="renderHint" class="render-hint hidden"></p>
+          <div class="render-actions">
+            <button id="renderScenarioBtn" class="btn btn-primary" disabled>Сгенерировать видео</button>
+          </div>
+          <div id="renderProgress" class="scan-progress hidden">
+            <p class="scan-eta">Рендеринг… 30–120 сек</p>
+          </div>
+          <div id="renderResult" class="render-result hidden">
+            <a id="renderDownload" class="btn btn-secondary" download>Скачать видео</a>
+          </div>
+        </section>
       </div>
     </div>
 
