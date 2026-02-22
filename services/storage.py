@@ -19,6 +19,20 @@ class Storage(Protocol):
         """Get local path to uploaded file."""
         ...
 
+    def save_asset(
+        self, project_id: str, asset_id: str, file: BinaryIO, filename: str
+    ) -> str:
+        """Save asset file to uploads/{project_id}/{asset_id}/{filename}. Return file_key."""
+        ...
+
+    def get_asset_path(self, file_key: str) -> Path:
+        """Get local path to asset file."""
+        ...
+
+    def delete_asset(self, file_key: str) -> None:
+        """Delete asset file and empty parent dirs."""
+        ...
+
     def save_output(self, key: str | None, source_path: Path) -> str:
         """Save processed file, return storage key."""
         ...
@@ -47,7 +61,7 @@ class LocalStorage:
 
     def _resolve_safe(self, base: Path, key: str) -> Path:
         """Resolve path and ensure it stays inside base (prevents path traversal)."""
-        if ".." in key or "/" in key or "\\" in key:
+        if ".." in key:
             raise FileNotFoundError("Invalid path")
         path = (base / key).resolve()
         try:
@@ -66,6 +80,35 @@ class LocalStorage:
             if f.suffix in (".mp4", ".mov", ".avi", ".webm"):
                 return f
         raise FileNotFoundError(f"No video file in {key}")
+
+    def save_asset(
+        self, project_id: str, asset_id: str, file: BinaryIO, filename: str
+    ) -> str:
+        """Save asset to uploads/{project_id}/{asset_id}/{filename}."""
+        safe_name = Path(filename).name if filename else "file"
+        dest_dir = self.upload_dir / project_id / asset_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / safe_name
+        with open(dest_path, "wb") as f:
+            shutil.copyfileobj(file, f)
+        return f"{project_id}/{asset_id}/{safe_name}"
+
+    def get_asset_path(self, file_key: str) -> Path:
+        """Get path to asset file."""
+        path = self._resolve_safe(self.upload_dir, file_key)
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"Asset not found: {file_key}")
+        return path
+
+    def delete_asset(self, file_key: str) -> None:
+        """Delete asset file and parent dirs if empty."""
+        path = self._resolve_safe(self.upload_dir, file_key)
+        if path.exists():
+            path.unlink()
+            parent = path.parent
+            while parent != self.upload_dir and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
 
     def save_output(self, key: str | None, source_path: Path) -> str:
         key = key or str(uuid.uuid4())
@@ -91,10 +134,11 @@ class LocalStorage:
             raise FileNotFoundError(f"File not found: {prefix}/{key}")
         if dir_path.is_file():
             return dir_path
+        exts = (".mp4", ".mov", ".avi", ".webm", ".jpg", ".jpeg", ".png", ".webp")
         for f in dir_path.iterdir():
-            if f.suffix in (".mp4", ".mov", ".avi", ".webm"):
+            if f.suffix.lower() in exts:
                 return f
-        raise FileNotFoundError(f"No video in {prefix}/{key}")
+        raise FileNotFoundError(f"No media file in {prefix}/{key}")
 
 
 def get_storage() -> Storage:

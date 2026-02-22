@@ -17,7 +17,10 @@ from google import genai
 from google.genai import types
 
 from config import get_gemini_api_key
+from schemas.scenario import Scenario
 from schemas.tasks import PlanResponse
+
+from services.scenario_service import tasks_to_scenario, validate_scenario
 
 logger = logging.getLogger(__name__)
 
@@ -699,3 +702,63 @@ def scan_broll_suggestions(
 
     logger.info("BrollScan: %d предложений готово", len(result))
     return result
+
+
+def generate_scenario(
+    assets: list[dict],
+    global_prompt: str,
+    reference_links: list[str] | None = None,
+    storage=None,
+) -> Scenario:
+    """
+    Generate Scenario (scenes + layers) from assets and prompt.
+
+    Uses existing analyze_and_generate_plan for first video, then converts
+    to Scenario via tasks_to_scenario.
+    """
+    if not assets:
+        raise ValueError("At least one asset required")
+    if not global_prompt.strip():
+        raise ValueError("global_prompt is required")
+
+    if storage is None:
+        from services.storage import get_storage
+        storage = get_storage()
+
+    # Find first video asset
+    video_asset = None
+    for a in assets:
+        if a.get("type") == "video":
+            video_asset = a
+            break
+    if not video_asset:
+        raise ValueError("At least one video asset required for scenario generation")
+
+    file_key = video_asset.get("file_key")
+    if not file_key:
+        raise ValueError("Asset missing file_key")
+    video_path = storage.get_asset_path(file_key)
+    total_duration = video_asset.get("duration_sec") or _get_video_duration(video_path)
+    if total_duration <= 0:
+        total_duration = _get_video_duration(video_path)
+
+    # Use existing plan generation (well-tested)
+    plan_dict = analyze_and_generate_plan(video_path, global_prompt)
+
+    # Convert to Scenario
+    plan = PlanResponse(
+        scenario_name=plan_dict["scenario_name"],
+        scenario_description=plan_dict["scenario_description"],
+        metadata=plan_dict.get("metadata", {}),
+        tasks=plan_dict.get("tasks", []),
+    )
+    scenario = tasks_to_scenario(plan, assets, total_duration)
+
+    # Validate
+    errors = validate_scenario(scenario, assets)
+    if errors:
+        for e in errors:
+            logger.warning("Scenario validation: %s", e.message)
+        # Don't fail on validation warnings for MVP - we still return the scenario
+
+    return scenario

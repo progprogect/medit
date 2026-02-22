@@ -1,0 +1,124 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ai-video-editing.local/schemas/scenario.json",
+  "title": "Scenario",
+  "description": "Scene-based + Layer-based video editing scenario (MVP)",
+  "type": "object",
+  "required": ["version", "scenes", "layers", "metadata"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Schema version for optimistic locking"
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "total_duration_sec": { "type": "number" },
+        "aspect_ratio": { "type": "string", "default": "9:16" }
+      }
+    },
+    "scenes": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/Scene" }
+    },
+    "layers": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/Layer" }
+    }
+  },
+  "definitions": {
+    "Scene": {
+      "type": "object",
+      "required": ["id", "start_sec", "end_sec"],
+      "properties": {
+        "id": { "type": "string" },
+        "start_sec": { "type": "number", "minimum": 0 },
+        "end_sec": { "type": "number", "minimum": 0 },
+        "visual_description": { "type": "string" },
+        "voiceover_text": { "type": ["string", "null"] },
+        "overlays": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": { "type": "string" },
+              "position": { "type": "string" },
+              "start_sec": { "type": "number" },
+              "end_sec": { "type": "number" }
+            }
+          }
+        },
+        "effects": { "type": "array", "items": { "type": "string" } },
+        "transition": { "type": "string" },
+        "asset_refs": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/AssetRef" }
+        },
+        "generation_tasks": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/GenerationTaskRef" }
+        }
+      }
+    },
+    "Layer": {
+      "type": "object",
+      "required": ["id", "type", "segments"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": [
+            "video", "image", "text", "subtitle",
+            "audio", "music", "sfx", "effects", "overlays", "generated"
+          ]
+        },
+        "order": { "type": "integer", "default": 0 },
+        "segments": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/Segment" }
+        }
+      }
+    },
+    "Segment": {
+      "type": "object",
+      "required": ["id", "start_sec", "end_sec"],
+      "properties": {
+        "id": { "type": "string" },
+        "start_sec": { "type": "number", "minimum": 0 },
+        "end_sec": { "type": "number", "minimum": 0 },
+        "asset_id": { "type": ["string", "null"] },
+        "asset_source": {
+          "type": "string",
+          "enum": ["uploaded", "suggested", "generated"]
+        },
+        "asset_status": {
+          "type": "string",
+          "enum": ["ready", "pending", "generating", "error"]
+        },
+        "scene_id": { "type": ["string", "null"] },
+        "params": { "type": "object" },
+        "generation_task_id": { "type": ["string", "null"] }
+      }
+    },
+    "AssetRef": {
+      "type": "object",
+      "properties": {
+        "asset_id": { "type": "string" },
+        "media_id": { "type": "string" },
+        "usage": { "type": "string" }
+      }
+    },
+    "GenerationTaskRef": {
+      "type": "object",
+      "properties": {
+        "task_type": { "type": "string" },
+        "params": { "type": "object" },
+        "segment_id": { "type": "string" }
+      }
+    }
+  }
+}

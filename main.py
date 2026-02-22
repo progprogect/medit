@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import tempfile
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -12,11 +13,15 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from api.routes import router as api_router
 from services.gemini import analyze_and_generate_plan, analyze_and_generate_tasks, scan_broll_suggestions
 from services.executor import run_tasks
 from services.storage import get_storage
 
+logger = logging.getLogger(__name__)
 app = FastAPI(title="AI Video Editing")
+
+app.include_router(api_router, prefix="/api")
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -292,4 +297,11 @@ async def serve_file(prefix: str, key: str):
         path = storage.get_file_path(prefix, key)
     except FileNotFoundError:
         raise HTTPException(404, "File not found")
-    return FileResponse(path, media_type="video/mp4")
+    suffix = path.suffix.lower()
+    media_type = (
+        "image/jpeg" if suffix in (".jpg", ".jpeg") else
+        "image/png" if suffix == ".png" else
+        "image/webp" if suffix == ".webp" else
+        "video/mp4"
+    )
+    return FileResponse(path, media_type=media_type)

@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "metadata": {
+    "name": "B2B LeadGen Promo",
+    "description": "Рекламное видео с тезисами и B-roll вставками",
+    "total_duration_sec": 59,
+    "aspect_ratio": "9:16"
+  },
+  "scenes": [
+    {
+      "id": "scene_1",
+      "start_sec": 0,
+      "end_sec": 10,
+      "visual_description": "Спикер в кадре, приветствие",
+      "voiceover_text": "Привет! Я Никита, помогаю B2B компаниям настраивать лидогенерацию.",
+      "overlays": [
+        { "text": "Привет! Я Никита!", "position": "center", "start_sec": 0, "end_sec": 1.5 }
+      ],
+      "effects": [],
+      "transition": "cut",
+      "asset_refs": [{ "asset_id": "media_1", "media_id": "clip_1", "usage": "main" }],
+      "generation_tasks": []
+    },
+    {
+      "id": "scene_2",
+      "start_sec": 10,
+      "end_sec": 15,
+      "visual_description": "B-roll: человек за ноутбуком",
+      "voiceover_text": null,
+      "overlays": [],
+      "effects": [],
+      "transition": "cut",
+      "asset_refs": [{ "asset_id": "broll_1", "media_id": null, "usage": "broll" }],
+      "generation_tasks": [
+        {
+          "task_type": "fetch_stock_video",
+          "params": { "query": "person typing laptop close-up" },
+          "segment_id": "seg_broll_1"
+        }
+      ]
+    },
+    {
+      "id": "scene_3",
+      "start_sec": 15,
+      "end_sec": 59,
+      "visual_description": "Спикер продолжает, CTA",
+      "voiceover_text": "Напишите, пока окна свободны!",
+      "overlays": [
+        { "text": "Напишите, пока окна свободны!", "position": "center", "start_sec": 57, "end_sec": 59 }
+      ],
+      "effects": [],
+      "transition": "cut",
+      "asset_refs": [{ "asset_id": "media_1", "media_id": "clip_1", "usage": "main" }],
+      "generation_tasks": []
+    }
+  ],
+  "layers": [
+    {
+      "id": "layer_video_1",
+      "type": "video",
+      "order": 0,
+      "segments": [
+        {
+          "id": "seg_main_1",
+          "start_sec": 0,
+          "end_sec": 10,
+          "asset_id": "media_1",
+          "asset_source": "uploaded",
+          "asset_status": "ready",
+          "scene_id": "scene_1",
+          "params": {}
+        },
+        {
+          "id": "seg_broll_1",
+          "start_sec": 10,
+          "end_sec": 15,
+          "asset_id": null,
+          "asset_source": "generated",
+          "asset_status": "pending",
+          "scene_id": "scene_2",
+          "params": {},
+          "generation_task_id": "gen_1"
+        },
+        {
+          "id": "seg_main_2",
+          "start_sec": 15,
+          "end_sec": 59,
+          "asset_id": "media_1",
+          "asset_source": "uploaded",
+          "asset_status": "ready",
+          "scene_id": "scene_3",
+          "params": {}
+        }
+      ]
+    },
+    {
+      "id": "layer_text_1",
+      "type": "text",
+      "order": 1,
+      "segments": [
+        {
+          "id": "seg_text_1",
+          "start_sec": 0,
+          "end_sec": 1.5,
+          "asset_id": null,
+          "asset_source": "generated",
+          "asset_status": "ready",
+          "scene_id": "scene_1",
+          "params": { "text": "Привет! Я Никита!", "position": "center", "font_size": 60 }
+        },
+        {
+          "id": "seg_text_2",
+          "start_sec": 57,
+          "end_sec": 59,
+          "asset_id": null,
+          "asset_source": "generated",
+          "asset_status": "ready",
+          "scene_id": "scene_3",
+          "params": { "text": "Напишите, пока окна свободны!", "position": "center", "font_size": 56 }
+        }
+      ]
+    },
+    {
+      "id": "layer_audio_1",
+      "type": "audio",
+      "order": 2,
+      "segments": [
+        {
+          "id": "seg_audio_main",
+          "start_sec": 0,
+          "end_sec": 59,
+          "asset_id": "media_1",
+          "asset_source": "uploaded",
+          "asset_status": "ready",
+          "scene_id": null,
+          "params": {}
+        }
+      ]
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 .env
+app.db
 uploads/
 outputs/
 __pycache__/

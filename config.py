@@ -54,3 +54,8 @@ def get_output_dir() -> Path:
     path = Path(os.environ.get("OUTPUT_DIR", "outputs"))
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def get_database_url() -> str:
+    """Database URL for SQLAlchemy. Default: SQLite for local dev."""
+    return os.environ.get("DATABASE_URL", "sqlite:///./app.db")

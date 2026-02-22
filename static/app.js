@@ -2,6 +2,9 @@
 let videoKey = null;
 let selectedMaxInserts = 3;
 let currentSuggestions = [];
+let currentProjectId = null;
+let createAssets = [];
+let currentScenario = null;
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 const scanHint      = document.getElementById("scanHint");
@@ -44,6 +47,23 @@ const preview       = document.getElementById("preview");
 const previewVideo  = document.getElementById("previewVideo");
 const downloadBtn   = document.getElementById("downloadBtn");
 
+// Create Scenario tab
+const legacyUploadSection = document.getElementById("legacyUploadSection");
+const createDropzone = document.getElementById("createDropzone");
+const createFileInput = document.getElementById("createFileInput");
+const createDropzoneText = document.getElementById("createDropzoneText");
+const assetList = document.getElementById("assetList");
+const globalPrompt = document.getElementById("globalPrompt");
+const referenceLink = document.getElementById("referenceLink");
+const generateScenarioBtn = document.getElementById("generateScenarioBtn");
+const createProgress = document.getElementById("createProgress");
+const createScenarioScreen = document.getElementById("createScenarioScreen");
+const scenarioScreen = document.getElementById("scenarioScreen");
+const scenarioHeader = document.getElementById("scenarioHeader");
+const scenesView = document.getElementById("scenesView");
+const timelineView = document.getElementById("timelineView");
+const viewTabs = document.querySelectorAll(".view-tab");
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 function showError(msg) {
   errorEl.textContent = msg;
@@ -81,6 +101,223 @@ tabBtns.forEach(btn => {
     tabContents.forEach(c => c.classList.remove("active"));
     btn.classList.add("active");
     document.getElementById(`tab-${btn.dataset.tab}`).classList.add("active");
+    if (legacyUploadSection) {
+      legacyUploadSection.style.display = btn.dataset.tab === "create" ? "none" : "block";
+    }
+  });
+});
+
+if (legacyUploadSection) {
+  legacyUploadSection.style.display = "none";
+}
+
+// ─── Create Scenario ───────────────────────────────────────────────────────────
+async function ensureProject() {
+  if (currentProjectId) return currentProjectId;
+  const res = await fetch("/api/projects", { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to create project");
+  }
+  const data = await res.json();
+  currentProjectId = data.id;
+  return currentProjectId;
+}
+
+createDropzone.addEventListener("click", () => createFileInput.click());
+
+createDropzone.addEventListener("dragover", e => {
+  e.preventDefault();
+  createDropzone.classList.add("dragover");
+});
+
+createDropzone.addEventListener("dragleave", () => createDropzone.classList.remove("dragover"));
+
+createDropzone.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  createDropzone.classList.remove("dragover");
+  const files = Array.from(e.dataTransfer.files).filter(f => {
+    const ext = "." + (f.name.split(".").pop() || "").toLowerCase();
+    return [".mp4", ".mov", ".avi", ".webm", ".jpg", ".jpeg", ".png", ".webp"].includes(ext);
+  });
+  if (files.length) await uploadCreateAssets(files);
+});
+
+createFileInput.addEventListener("change", async () => {
+  const files = Array.from(createFileInput.files || []);
+  if (files.length) await uploadCreateAssets(files);
+  createFileInput.value = "";
+});
+
+async function uploadCreateAssets(files) {
+  if (files.length > 10) {
+    showError("Максимум 10 файлов");
+    files = files.slice(0, 10);
+  }
+  hideError();
+  const projectId = await ensureProject();
+  const formData = new FormData();
+  files.forEach(f => formData.append("files", f));
+
+  createDropzoneText.textContent = "Загрузка…";
+  generateScenarioBtn.disabled = true;
+
+  try {
+    const res = await fetch(`/api/projects/${projectId}/assets`, {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+    const data = await res.json();
+    createAssets = createAssets.concat(data.assets || []);
+    renderAssetList();
+    createDropzoneText.textContent = "Перетащите видео или изображения сюда (до 10 файлов)";
+  } catch (err) {
+    showError(err.message || "Ошибка загрузки");
+    createDropzoneText.textContent = "Перетащите видео или изображения сюда (до 10 файлов)";
+  }
+  updateCreateButtons();
+}
+
+function renderAssetList() {
+  assetList.innerHTML = "";
+  createAssets.forEach((a, i) => {
+    const card = document.createElement("div");
+    card.className = "asset-card";
+    const thumbUrl = a.type === "video"
+      ? `/files/uploads/${a.file_key}`
+      : `/files/uploads/${a.file_key}`;
+    const ext = (a.filename || "").split(".").pop() || "";
+    const isVideo = ["mp4", "mov", "avi", "webm"].includes(ext.toLowerCase());
+    const thumb = isVideo
+      ? `<video class="asset-thumb" src="${thumbUrl}" muted preload="metadata"></video>`
+      : `<img class="asset-thumb" src="${thumbUrl}" alt="">`;
+    card.innerHTML = `
+      ${thumb}
+      <div class="asset-info">
+        <div class="asset-name">${escapeHtml(a.filename)}</div>
+        <div class="asset-meta">${a.type === "video" && a.duration_sec ? formatTime(a.duration_sec) : "Изображение"}</div>
+        <input type="text" class="asset-description" data-id="${a.id}" placeholder="Что сделать с этим элементом?" value="${escapeHtml(a.user_description || "")}">
+      </div>
+    `;
+    assetList.appendChild(card);
+  });
+
+  assetList.querySelectorAll(".asset-description").forEach(input => {
+    input.addEventListener("input", () => {
+      const a = createAssets.find(x => x.id === input.dataset.id);
+      if (a) a.user_description = input.value;
+    });
+  });
+}
+
+function updateCreateButtons() {
+  const hasAssets = createAssets.length > 0;
+  const hasPrompt = globalPrompt && globalPrompt.value.trim().length >= 10;
+  const hasVideo = createAssets.some(a => a.type === "video");
+  generateScenarioBtn.disabled = !(hasAssets && hasPrompt && hasVideo);
+}
+
+globalPrompt.addEventListener("input", updateCreateButtons);
+
+generateScenarioBtn.addEventListener("click", async () => {
+  if (!currentProjectId || createAssets.length === 0 || !globalPrompt.value.trim()) return;
+  const hasVideo = createAssets.some(a => a.type === "video");
+  if (!hasVideo) {
+    showError("Нужно хотя бы одно видео");
+    return;
+  }
+
+  hideError();
+  createScenarioScreen.classList.add("hidden");
+  createProgress.classList.remove("hidden");
+  generateScenarioBtn.disabled = true;
+
+  const assetDescriptions = {};
+  createAssets.forEach(a => {
+    if (a.user_description) assetDescriptions[a.id] = a.user_description;
+  });
+
+  const refLinks = referenceLink && referenceLink.value.trim()
+    ? [referenceLink.value.trim()]
+    : undefined;
+
+  try {
+    const res = await fetch(`/api/projects/${currentProjectId}/scenario/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        global_prompt: globalPrompt.value.trim(),
+        asset_descriptions: Object.keys(assetDescriptions).length ? assetDescriptions : undefined,
+        reference_links: refLinks,
+      }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+    currentScenario = await res.json();
+
+    createProgress.classList.add("hidden");
+    scenarioScreen.classList.remove("hidden");
+    renderScenarioHeader(currentScenario);
+    renderScenesView(currentScenario);
+  } catch (err) {
+    createProgress.classList.add("hidden");
+    createScenarioScreen.classList.remove("hidden");
+    showError(err.message || "Ошибка генерации сценария");
+  } finally {
+    generateScenarioBtn.disabled = false;
+    updateCreateButtons();
+  }
+});
+
+function renderScenarioHeader(scenario) {
+  const m = scenario.metadata || {};
+  scenarioHeader.innerHTML = `
+    <h3>${escapeHtml(m.name || "Сценарий")}</h3>
+    ${m.description ? `<p class="desc">${escapeHtml(m.description)}</p>` : ""}
+    ${m.total_duration_sec ? `<p class="duration">Длительность: ${formatTime(m.total_duration_sec)}</p>` : ""}
+  `;
+}
+
+function renderScenesView(scenario) {
+  const scenes = scenario.scenes || [];
+  scenesView.innerHTML = "";
+  scenes.forEach((scene, i) => {
+    const card = document.createElement("div");
+    card.className = "scene-card";
+    const hasGen = (scene.generation_tasks || []).length > 0;
+    card.innerHTML = `
+      <div class="scene-card-header">
+        <span>Сцена ${i + 1}</span>
+        <span class="scene-time">${formatTime(scene.start_sec)} – ${formatTime(scene.end_sec)}</span>
+        ${hasGen ? '<span class="scene-badge">needs AI</span>' : ""}
+      </div>
+      <div class="scene-card-body">
+        ${scene.visual_description ? `<div class="scene-visual">${escapeHtml(scene.visual_description)}</div>` : ""}
+        ${scene.voiceover_text ? `<div class="scene-voiceover">${escapeHtml(scene.voiceover_text)}</div>` : ""}
+        ${(scene.overlays || []).length ? `
+          <div class="scene-overlays">
+            <h4>Надписи:</h4>
+            <ul>
+              ${scene.overlays.map(o => `<li>${escapeHtml(o.text || "")}</li>`).join("")}
+            </ul>
+          </div>
+        ` : ""}
+      </div>
+    `;
+    card.querySelector(".scene-card-header").addEventListener("click", () => {
+      card.classList.toggle("expanded");
+    });
+    scenesView.appendChild(card);
+  });
+}
+
+viewTabs.forEach(btn => {
+  btn.addEventListener("click", () => {
+    viewTabs.forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    const isScenes = btn.dataset.view === "scenes";
+    scenesView.classList.toggle("hidden", !isScenes);
+    timelineView.classList.toggle("hidden", isScenes);
   });
 });
 

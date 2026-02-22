@@ -13,8 +13,8 @@
       <p class="subtitle">Интеллектуальное редактирование видео</p>
     </div>
 
-    <!-- Загрузка видео (общая для всех вкладок) -->
-    <section class="upload-section">
+    <!-- Загрузка видео (общая для B-Roll и Редактора) -->
+    <section id="legacyUploadSection" class="upload-section">
       <div id="dropzone" class="dropzone">
         <input type="file" id="fileInput" accept="video/mp4,video/quicktime,video/x-msvideo,video/webm" hidden>
         <p id="dropzoneText">Перетащите видео сюда или нажмите для выбора</p>
@@ -24,12 +24,48 @@
 
     <!-- Вкладки -->
     <nav class="tabs">
-      <button class="tab-btn active" data-tab="broll">🎬 Вставки (B-Roll)</button>
+      <button class="tab-btn active" data-tab="create">📋 Create Scenario</button>
+      <button class="tab-btn" data-tab="broll">🎬 Вставки (B-Roll)</button>
       <button class="tab-btn" data-tab="edit">✏️ Редактор</button>
     </nav>
 
+    <!-- ══════════ ВКЛАДКА: CREATE SCENARIO ══════════ -->
+    <div id="tab-create" class="tab-content active">
+      <div id="createScenarioScreen">
+        <section class="create-upload">
+          <h2>Добавьте медиа</h2>
+          <div id="createDropzone" class="dropzone create-dropzone">
+            <input type="file" id="createFileInput" accept="video/mp4,video/quicktime,video/x-msvideo,video/webm,image/jpeg,image/png,image/webp" multiple hidden>
+            <p id="createDropzoneText">Перетащите видео или изображения сюда (до 10 файлов)</p>
+          </div>
+          <div id="assetList" class="asset-list"></div>
+        </section>
+        <section class="create-prompt">
+          <h2>Опишите желаемый результат</h2>
+          <textarea id="globalPrompt" rows="4" placeholder="Например: Сделай рекламное видео с тезисами и B-roll вставками"></textarea>
+        </section>
+        <section class="create-reference">
+          <label for="referenceLink">Референс (опционально)</label>
+          <input type="url" id="referenceLink" placeholder="https://instagram.com/... или https://youtube.com/...">
+        </section>
+        <button id="generateScenarioBtn" class="btn btn-primary" disabled>Generate scenario</button>
+        <div id="createProgress" class="scan-progress hidden">
+          <p class="scan-eta">Генерация сценария… 30–90 сек</p>
+        </div>
+      </div>
+      <div id="scenarioScreen" class="hidden">
+        <div id="scenarioHeader" class="scenario-header"></div>
+        <div class="view-tabs">
+          <button class="view-tab active" data-view="scenes">Сцены</button>
+          <button class="view-tab" data-view="timeline">Таймлайн</button>
+        </div>
+        <div id="scenesView" class="scenes-view"></div>
+        <div id="timelineView" class="timeline-view hidden"></div>
+      </div>
+    </div>
+
     <!-- ══════════ ВКЛАДКА: ВСТАВКИ ══════════ -->
-    <div id="tab-broll" class="tab-content active">
+    <div id="tab-broll" class="tab-content">
 
       <div class="tab-intro">
         <p>Система проанализирует видео, найдёт лучшие моменты для вставки стоковых клипов и предложит конкретные варианты.</p>
