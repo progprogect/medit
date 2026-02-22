@@ -601,6 +601,24 @@ textarea:focus {
   50% { opacity: 0.7; }
 }
 
+.voice-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.voice-indicator {
+  font-size: 0.9rem;
+  color: #666;
+  animation: pulse-rec 1.5s ease-in-out infinite;
+}
+
+.btn-stop {
+  background: #ffebee !important;
+  border-color: #e57373 !important;
+}
+
 .scenario-refine {
   margin: 16px 0;
   padding: 12px;

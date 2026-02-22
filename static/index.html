@@ -44,7 +44,12 @@
           <h2>Опишите желаемый результат</h2>
           <div class="prompt-input-wrap">
             <textarea id="globalPrompt" rows="4" placeholder="Например: Сделай рекламное видео с тезисами и B-roll вставками"></textarea>
-            <button id="voicePromptBtn" class="btn-icon" type="button" title="Голосовой ввод">🎤</button>
+            <div class="voice-controls">
+              <button id="voicePromptBtn" class="btn-icon" type="button" title="Начать запись">🎤</button>
+              <span id="voiceRecordingIndicator" class="voice-indicator hidden">Идёт запись…</span>
+              <button id="voiceStopBtn" class="btn-icon btn-stop hidden" type="button" title="Закончить запись и распознать">⏹ Закончить</button>
+              <span id="voiceTranscribingIndicator" class="voice-indicator hidden">Распознавание…</span>
+            </div>
           </div>
         </section>
         <section class="create-reference">

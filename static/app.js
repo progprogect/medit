@@ -223,17 +223,18 @@ function updateCreateButtons() {
 
 globalPrompt.addEventListener("input", updateCreateButtons);
 
+const voiceRecordingIndicator = document.getElementById("voiceRecordingIndicator");
+const voiceStopBtn = document.getElementById("voiceStopBtn");
+const voiceTranscribingIndicator = document.getElementById("voiceTranscribingIndicator");
+
+let voiceRecorder = null;
 if (voicePromptBtn) {
-  let voiceRecorder = null;
   voicePromptBtn.addEventListener("click", async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
       showError("Микрофон не поддерживается в этом браузере");
       return;
     }
-    if (voiceRecorder) {
-      voiceRecorder.stop();
-      return;
-    }
+    if (voiceRecorder) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const recorder = new MediaRecorder(stream);
@@ -245,10 +246,13 @@ if (voicePromptBtn) {
         stream.getTracks().forEach((t) => t.stop());
         voicePromptBtn.classList.remove("recording");
         voicePromptBtn.disabled = false;
+        if (voiceRecordingIndicator) voiceRecordingIndicator.classList.add("hidden");
+        if (voiceStopBtn) voiceStopBtn.classList.add("hidden");
         if (chunks.length === 0) {
           showError("Запись пуста");
           return;
         }
+        if (voiceTranscribingIndicator) voiceTranscribingIndicator.classList.remove("hidden");
         const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
         const formData = new FormData();
         formData.append("audio", blob, "voice.webm");
@@ -266,13 +270,25 @@ if (voicePromptBtn) {
           }
         } catch (err) {
           showError(err.message || "Ошибка распознавания");
+        } finally {
+          if (voiceTranscribingIndicator) voiceTranscribingIndicator.classList.add("hidden");
         }
       };
       voicePromptBtn.classList.add("recording");
       voicePromptBtn.disabled = true;
+      if (voiceRecordingIndicator) voiceRecordingIndicator.classList.remove("hidden");
+      if (voiceStopBtn) voiceStopBtn.classList.remove("hidden");
       recorder.start();
     } catch (err) {
       showError(err.message || "Нет доступа к микрофону");
+    }
+  });
+}
+
+if (voiceStopBtn) {
+  voiceStopBtn.addEventListener("click", () => {
+    if (voiceRecorder) {
+      voiceRecorder.stop();
     }
   });
 }
