@@ -54,12 +54,15 @@ const createFileInput = document.getElementById("createFileInput");
 const createDropzoneText = document.getElementById("createDropzoneText");
 const assetList = document.getElementById("assetList");
 const globalPrompt = document.getElementById("globalPrompt");
+const voicePromptBtn = document.getElementById("voicePromptBtn");
 const referenceLink = document.getElementById("referenceLink");
 const generateScenarioBtn = document.getElementById("generateScenarioBtn");
 const createProgress = document.getElementById("createProgress");
 const createScenarioScreen = document.getElementById("createScenarioScreen");
 const scenarioScreen = document.getElementById("scenarioScreen");
 const scenarioHeader = document.getElementById("scenarioHeader");
+const refinePrompt = document.getElementById("refinePrompt");
+const refineScenarioBtn = document.getElementById("refineScenarioBtn");
 const scenesView = document.getElementById("scenesView");
 const timelineView = document.getElementById("timelineView");
 const viewTabs = document.querySelectorAll(".view-tab");
@@ -220,6 +223,60 @@ function updateCreateButtons() {
 
 globalPrompt.addEventListener("input", updateCreateButtons);
 
+if (voicePromptBtn) {
+  let voiceRecorder = null;
+  voicePromptBtn.addEventListener("click", async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      showError("Микрофон не поддерживается в этом браузере");
+      return;
+    }
+    if (voiceRecorder) {
+      voiceRecorder.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      voiceRecorder = recorder;
+      const chunks = [];
+      recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+      recorder.onstop = async () => {
+        voiceRecorder = null;
+        stream.getTracks().forEach((t) => t.stop());
+        voicePromptBtn.classList.remove("recording");
+        voicePromptBtn.disabled = false;
+        if (chunks.length === 0) {
+          showError("Запись пуста");
+          return;
+        }
+        const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+        const formData = new FormData();
+        formData.append("audio", blob, "voice.webm");
+        try {
+          const res = await fetch("/api/transcribe-audio", { method: "POST", body: formData });
+          if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+          const data = await res.json();
+          const text = (data.text || "").trim();
+          if (text) {
+            const sep = globalPrompt.value.trim() ? " " : "";
+            globalPrompt.value += sep + text;
+            updateCreateButtons();
+          } else {
+            showError("Не удалось распознать речь");
+          }
+        } catch (err) {
+          showError(err.message || "Ошибка распознавания");
+        }
+      };
+      voicePromptBtn.classList.add("recording");
+      voicePromptBtn.disabled = true;
+      recorder.start();
+    } catch (err) {
+      showError(err.message || "Нет доступа к микрофону");
+    }
+  });
+}
+
 generateScenarioBtn.addEventListener("click", async () => {
   if (!currentProjectId || createAssets.length === 0 || !globalPrompt.value.trim()) return;
   const hasVideo = createAssets.some(a => a.type === "video");
@@ -259,6 +316,7 @@ generateScenarioBtn.addEventListener("click", async () => {
     scenarioScreen.classList.remove("hidden");
     renderScenarioHeader(currentScenario);
     renderScenesView(currentScenario);
+    renderTimelineView(currentScenario);
   } catch (err) {
     createProgress.classList.add("hidden");
     createScenarioScreen.classList.remove("hidden");
@@ -269,6 +327,34 @@ generateScenarioBtn.addEventListener("click", async () => {
   }
 });
 
+if (refineScenarioBtn && refinePrompt) {
+  refineScenarioBtn.addEventListener("click", async () => {
+    const prompt = refinePrompt.value.trim();
+    if (!prompt || !currentProjectId) return;
+    hideError();
+    refineScenarioBtn.disabled = true;
+    refineScenarioBtn.textContent = "…";
+    try {
+      const res = await fetch(`/api/projects/${currentProjectId}/scenario/refine`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refinement_prompt: prompt }),
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+      currentScenario = await res.json();
+      refinePrompt.value = "";
+      renderScenarioHeader(currentScenario);
+      renderScenesView(currentScenario);
+      renderTimelineView(currentScenario);
+    } catch (err) {
+      showError(err.message || "Ошибка доработки сценария");
+    } finally {
+      refineScenarioBtn.disabled = false;
+      refineScenarioBtn.textContent = "Применить";
+    }
+  });
+}
+
 function renderScenarioHeader(scenario) {
   const m = scenario.metadata || {};
   scenarioHeader.innerHTML = `
@@ -276,6 +362,54 @@ function renderScenarioHeader(scenario) {
     ${m.description ? `<p class="desc">${escapeHtml(m.description)}</p>` : ""}
     ${m.total_duration_sec ? `<p class="duration">Длительность: ${formatTime(m.total_duration_sec)}</p>` : ""}
   `;
+}
+
+function renderTimelineView(scenario) {
+  const layers = (scenario.layers || []).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const totalSec = scenario.metadata?.total_duration_sec || 60;
+  const pxPerSec = Math.max(4, Math.min(20, 400 / totalSec));
+
+  const layerLabels = { video: "Видео", image: "Изображения", text: "Текст", audio: "Аудио", subtitle: "Субтитры" };
+
+  timelineView.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.className = "timeline-wrap";
+
+  const ruler = document.createElement("div");
+  ruler.className = "timeline-ruler";
+  const step = totalSec <= 30 ? 5 : totalSec <= 120 ? 10 : 30;
+  let ticks = "";
+  for (let t = 0; t <= totalSec; t += step) {
+    ticks += `<span class="timeline-tick" style="left:${t * pxPerSec}px">${formatTime(t)}</span>`;
+  }
+  ruler.innerHTML = `<div class="timeline-ruler-track" style="width:${totalSec * pxPerSec}px">${ticks}</div>`;
+  wrap.appendChild(ruler);
+
+  layers.forEach((layer) => {
+    const row = document.createElement("div");
+    row.className = "timeline-layer-row";
+    const label = document.createElement("div");
+    label.className = "timeline-layer-label";
+    label.textContent = layerLabels[layer.type] || layer.type;
+    row.appendChild(label);
+    const track = document.createElement("div");
+    track.className = "timeline-layer-track";
+    track.style.width = totalSec * pxPerSec + "px";
+    (layer.segments || []).forEach((seg) => {
+      const w = Math.max(2, (seg.end_sec - seg.start_sec) * pxPerSec);
+      const left = seg.start_sec * pxPerSec;
+      const block = document.createElement("div");
+      block.className = `timeline-segment timeline-segment-${seg.asset_source || "uploaded"}`;
+      block.style.width = w + "px";
+      block.style.left = left + "px";
+      block.title = `${formatTime(seg.start_sec)} – ${formatTime(seg.end_sec)}${seg.params?.text ? ": " + seg.params.text : ""}`;
+      track.appendChild(block);
+    });
+    row.appendChild(track);
+    wrap.appendChild(row);
+  });
+
+  timelineView.appendChild(wrap);
 }
 
 function renderScenesView(scenario) {

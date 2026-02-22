@@ -42,7 +42,10 @@
         </section>
         <section class="create-prompt">
           <h2>Опишите желаемый результат</h2>
-          <textarea id="globalPrompt" rows="4" placeholder="Например: Сделай рекламное видео с тезисами и B-roll вставками"></textarea>
+          <div class="prompt-input-wrap">
+            <textarea id="globalPrompt" rows="4" placeholder="Например: Сделай рекламное видео с тезисами и B-roll вставками"></textarea>
+            <button id="voicePromptBtn" class="btn-icon" type="button" title="Голосовой ввод">🎤</button>
+          </div>
         </section>
         <section class="create-reference">
           <label for="referenceLink">Референс (опционально)</label>
@@ -55,6 +58,13 @@
       </div>
       <div id="scenarioScreen" class="hidden">
         <div id="scenarioHeader" class="scenario-header"></div>
+        <section class="scenario-refine">
+          <label for="refinePrompt">Уточнить сценарий:</label>
+          <div class="refine-input-wrap">
+            <textarea id="refinePrompt" rows="2" placeholder="Например: Добавь больше текстовых тезисов, сократи до 30 сек"></textarea>
+            <button id="refineScenarioBtn" class="btn btn-secondary" type="button">Применить</button>
+          </div>
+        </section>
         <div class="view-tabs">
           <button class="view-tab active" data-view="scenes">Сцены</button>
           <button class="view-tab" data-view="timeline">Таймлайн</button>

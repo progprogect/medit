@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import tempfile
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -11,9 +13,10 @@ from pydantic import BaseModel
 from db.models import Asset, Project, Scenario as ScenarioModel
 from db.session import get_db
 from schemas.scenario import Scenario
-from services.gemini import generate_scenario
+from services.gemini import generate_scenario, refine_scenario
 from services.media_metadata import get_media_metadata
 from services.storage import get_storage
+from services.transcriber import transcribe_audio
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,29 @@ class ScenarioGenerateRequest(BaseModel):
     global_prompt: str
     asset_descriptions: Optional[dict[str, str]] = None
     reference_links: Optional[list[str]] = None
+
+
+@router.post("/transcribe-audio")
+async def transcribe_audio_endpoint(audio: UploadFile = File(...)):
+    """Transcribe voice recording to text (Whisper). Accepts webm, wav, mp3."""
+    if not audio.filename and not getattr(audio, "content_type", ""):
+        raise HTTPException(400, "Audio file required")
+    suffix = ".webm"
+    if audio.filename and "." in audio.filename:
+        suffix = "." + audio.filename.rsplit(".", 1)[-1].lower()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        content = await audio.read()
+        if len(content) == 0:
+            raise HTTPException(400, "Empty audio file")
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(400, "Audio too large (max 10 MB)")
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    try:
+        text = await asyncio.to_thread(transcribe_audio, tmp_path)
+        return {"text": text}
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 @router.post("/projects", response_model=CreateProjectResponse)
@@ -253,9 +279,61 @@ async def scenario_generate(project_id: str, body: ScenarioGenerateRequest):
     return scenario
 
 
+class RefineScenarioRequest(BaseModel):
+    refinement_prompt: str
+
+
+@router.post("/projects/{project_id}/scenario/refine", response_model=Scenario)
+async def scenario_refine(project_id: str, body: RefineScenarioRequest):
+    """Refine existing scenario with a new prompt."""
+    if not body.refinement_prompt.strip():
+        raise HTTPException(400, "refinement_prompt is required")
+
+    with get_db() as db:
+        sc = db.query(ScenarioModel).filter(ScenarioModel.project_id == project_id).first()
+        if not sc:
+            raise HTTPException(404, "Scenario not found")
+        scenario = Scenario.model_validate(sc.data)
+
+        assets = (
+            db.query(Asset)
+            .filter(Asset.project_id == project_id)
+            .order_by(Asset.order_index)
+            .all()
+        )
+        asset_dicts = [
+            {"id": a.id, "file_key": a.file_key, "type": a.type, "duration_sec": a.duration_sec}
+            for a in assets
+        ]
+
+    def _refine():
+        return refine_scenario(scenario, body.refinement_prompt.strip(), asset_dicts)
+
+    try:
+        updated = await asyncio.to_thread(_refine)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    scenario_dict = updated.model_dump()
+    scenario_dict["metadata"] = scenario_dict.get("metadata", {})
+    scenario_dict["metadata"]["asset_ids"] = [a["id"] for a in asset_dicts]
+
+    with get_db() as db:
+        existing = db.query(ScenarioModel).filter(ScenarioModel.project_id == project_id).first()
+        if existing:
+            existing.data = scenario_dict
+            existing.version += 1
+            existing.status = "draft"
+            db.commit()
+
+    return updated
+
+
 @router.get("/projects/{project_id}/scenario", response_model=Scenario)
 async def get_scenario(project_id: str):
     """Get scenario for project."""
+    from services.scenario_service import ensure_video_layer_matches_scenes
+
     with get_db() as db:
         sc = (
             db.query(ScenarioModel)
@@ -264,7 +342,10 @@ async def get_scenario(project_id: str):
         )
         if not sc:
             raise HTTPException(404, "Scenario not found")
-        return Scenario.model_validate(sc.data)
+        scenario = Scenario.model_validate(sc.data)
+        asset_ids = (scenario.metadata.asset_ids or []) if scenario.metadata else []
+        main_id = asset_ids[0] if asset_ids else None
+        return ensure_video_layer_matches_scenes(scenario, main_id)
 
 
 @router.put("/projects/{project_id}/scenario", response_model=Scenario)

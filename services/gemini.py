@@ -20,7 +20,7 @@ from config import get_gemini_api_key
 from schemas.scenario import Scenario
 from schemas.tasks import PlanResponse
 
-from services.scenario_service import tasks_to_scenario, validate_scenario
+from services.scenario_service import scenario_from_simple_output, tasks_to_scenario, validate_scenario
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ Your job: generate text overlays + stock clip descriptions. Do NOT change the B-
 TASK ORDER — always follow this exact sequence:
   1. auto_frame_face (if vertical format needed)
   2. trim (only if shortening)
-  3. add_text_overlay (key phrases, synced to transcript; 4-8 overlays total)
+  3. add_text_overlay (ONLY if user explicitly asked for text on screen; otherwise skip)
   4. fetch_stock_video (one per B-roll slot, with specific visual query)
   5. overlay_video (one per B-roll slot, using the pre-decided timestamps)
   6. color_correction (optional final polish)
@@ -57,11 +57,56 @@ RULES:
 - add_text_overlay params: text, position, font_size, font_color, shadow, background, start_time, end_time ONLY.
 - fetch_stock_video params: query, alternative_queries, duration_max, orientation ONLY. MUST have output_id.
 - overlay_video params: start_time, end_time, stock_id ONLY.
-- Text overlays: strong hook in first 3s, key points synced to speech, CTA near end.
-- Stock queries: describe a SPECIFIC visual scene (e.g. "man typing on laptop close-up screen" not "business").
+- Add text overlays ONLY when user explicitly requests text on screen. Otherwise generate ZERO add_text_overlay tasks.
+- If user requests content at the end of the video (outro, additional clip, etc.) — use the end slot (last seconds) for fetch_stock_video + overlay_video. Interpret the request to choose the stock query.
+- Stock queries: describe a SPECIFIC visual scene.
 - Do NOT generate more fetch_stock_video / overlay_video tasks than the pre-computed slots.
 
 NEVER mix params between task types. Generate ONLY valid JSON. No markdown."""
+
+# ─── Simple scenario (no transcription, no ffmpeg) ─────────────────────────────
+SCENARIO_SIMPLE_INSTRUCTION = """You are a video editor. You receive a video and a user prompt.
+Analyze the video visually and generate a scenario with text overlays.
+
+Return ONLY valid JSON (no markdown) with this structure:
+{
+  "metadata": {
+    "name": "short title",
+    "description": "brief description",
+    "total_duration_sec": <video duration in seconds>,
+    "aspect_ratio": "9:16"
+  },
+  "scenes": [{
+    "id": "scene_0",
+    "start_sec": 0,
+    "end_sec": <total_duration_sec>,
+    "visual_description": "what happens in the video",
+    "overlays": [
+      {"text": "overlay text", "position": "center|bottom|top", "start_sec": 2.0, "end_sec": 5.0},
+      ...
+    ]
+  }]
+}
+
+RULES:
+- Add text overlays ONLY when user explicitly requests them. Otherwise return overlays: [].
+- If user requests content at the end of the video — add a second scene or describe the stock clip to fetch based on the request.
+- position: "center", "bottom", or "top"
+- Overlays must not overlap; each 2-4 seconds
+- Match overlay content to user prompt when overlays are requested"""
+
+# ─── Refine scenario ────────────────────────────────────────────────────────────
+REFINE_INSTRUCTION = """You are a video editor. You receive:
+1. A current scenario (JSON with metadata, scenes, layers).
+2. A user refinement request.
+
+Your job: apply ONLY the requested changes and return the updated scenario in the exact same JSON structure.
+
+RULES:
+- Preserve metadata.total_duration_sec, metadata.aspect_ratio, asset_ids.
+- Preserve scene and segment IDs where possible.
+- Apply only what the user asked (e.g. add overlays, change text, remove B-roll, shorten).
+- Return valid JSON. No markdown."""
 
 # ─── Gemini JSON schema ────────────────────────────────────────────────────────
 PLAN_JSON_SCHEMA = {
@@ -571,6 +616,13 @@ def analyze_and_generate_plan(
     # Step 3: Compute B-roll slots (Python, deterministic)
     broll_slots = find_broll_slots(transcript_segments, duration_sec, rules)
 
+    # Add optional end slot — LLM will use it only when user requests content at the end
+    end_start = max(0, duration_sec - 6)
+    end_slot = {"start": end_start, "end": duration_sec, "context_text": user_prompt[:200]}
+    broll_slots = list(broll_slots)[: rules["max_inserts"] - 1] + [end_slot]
+    rules = dict(rules)
+    rules["max_inserts"] = len(broll_slots)
+
     # Step 4: Upload video and generate plan
     video_part = _upload_video(client, video_path, is_long)
 
@@ -579,9 +631,10 @@ def analyze_and_generate_plan(
     broll_constraint = ""
     if broll_slots:
         broll_constraint = (
-            f"\n\nPRE-COMPUTED B-ROLL SLOTS (DO NOT CHANGE THESE TIMESTAMPS):\n{slots_json}\n"
-            f"Generate exactly {len(broll_slots)} fetch_stock_video + overlay_video task pairs, "
-            f"using these exact start_time/end_time values. Use context_text to decide the stock query.\n"
+            f"\n\nB-ROLL SLOTS (use these timestamps):\n{slots_json}\n"
+            f"Generate fetch_stock_video + overlay_video for each slot that fits the user request. "
+            f"The last slot is for the end of the video — use it ONLY if user requests content at the end. "
+            f"Use context_text and user request to decide the stock query for each slot.\n"
         )
 
     segments_for_prompt = transcript_segments[:200] if transcript_segments else []
@@ -644,6 +697,17 @@ def analyze_and_generate_plan(
 
     # Step 5: Validate and fix (Python, deterministic)
     tasks = validate_and_fix_plan(tasks, rules)
+
+    # Fallback: if we have broll_slots but Gemini returned no overlay_video, synthesize from context
+    overlay_count = sum(1 for t in tasks if t["type"] == "overlay_video")
+    if broll_slots and overlay_count == 0:
+        logger.info("Gemini не вернул overlay_video — синтезируем из слотов")
+        for i, slot in enumerate(broll_slots):
+            out_id = f"stock_{i + 1}"
+            query = (slot.get("context_text") or "professional b-roll")[:80]
+            tasks.append({"type": "fetch_stock_video", "output_id": out_id, "params": {"query": query}})
+            tasks.append({"type": "overlay_video", "params": {"start_time": slot["start"], "end_time": slot["end"], "stock_id": out_id}})
+        tasks = validate_and_fix_plan(tasks, rules)
 
     return {
         "scenario_name": validated.scenario_name,
@@ -713,8 +777,9 @@ def generate_scenario(
     """
     Generate Scenario (scenes + layers) from assets and prompt.
 
-    Uses existing analyze_and_generate_plan for first video, then converts
-    to Scenario via tasks_to_scenario.
+    Uses analyze_and_generate_plan (transcription + Gemini) when possible.
+    Fallback to simple flow (no transcription) if ffmpeg audio extraction fails.
+    Result: scenario only, no video rendering.
     """
     if not assets:
         raise ValueError("At least one asset required")
@@ -742,23 +807,133 @@ def generate_scenario(
     if total_duration <= 0:
         total_duration = _get_video_duration(video_path)
 
-    # Use existing plan generation (well-tested)
-    plan_dict = analyze_and_generate_plan(video_path, global_prompt)
+    main_asset_id = video_asset.get("id", "")
 
-    # Convert to Scenario
-    plan = PlanResponse(
-        scenario_name=plan_dict["scenario_name"],
-        scenario_description=plan_dict["scenario_description"],
-        metadata=plan_dict.get("metadata", {}),
-        tasks=plan_dict.get("tasks", []),
-    )
-    scenario = tasks_to_scenario(plan, assets, total_duration)
+    # Try full flow with transcription first
+    try:
+        plan_dict = analyze_and_generate_plan(video_path, global_prompt)
+        tasks = plan_dict.get("tasks", [])
+
+        plan = PlanResponse(
+            scenario_name=plan_dict["scenario_name"],
+            scenario_description=plan_dict["scenario_description"],
+            metadata=plan_dict.get("metadata", {}),
+            tasks=tasks,
+        )
+        scenario = tasks_to_scenario(plan, assets, total_duration)
+    except (subprocess.CalledProcessError, OSError) as e:
+        # ffmpeg failed (e.g. audio extraction for MOV/codec issues)
+        logger.warning("Transcription/ffmpeg failed (%s), fallback to simple flow", e)
+        scenario = _generate_scenario_simple(video_path, main_asset_id, total_duration, global_prompt)
 
     # Validate
     errors = validate_scenario(scenario, assets)
     if errors:
         for e in errors:
             logger.warning("Scenario validation: %s", e.message)
-        # Don't fail on validation warnings for MVP - we still return the scenario
+
+    return scenario
+
+
+def _generate_scenario_simple(
+    video_path: Path, main_asset_id: str, total_duration: float, global_prompt: str
+) -> Scenario:
+    """Fallback: Gemini Vision only, no transcription."""
+    api_key = get_gemini_api_key()
+    client = genai.Client(api_key=api_key)
+    file_size_mb = video_path.stat().st_size / (1024 * 1024)
+    is_long = file_size_mb > 20
+    video_part = _upload_video(client, video_path, is_long)
+    prompt = (
+        f"Video duration: {total_duration:.1f} seconds. "
+        f"User request: {global_prompt}\n\nReturn the scenario JSON as specified."
+    )
+    logger.info("Gemini: generate_scenario (fallback, no transcription)...")
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[video_part, prompt],
+        config={
+            "system_instruction": SCENARIO_SIMPLE_INSTRUCTION,
+            "response_mime_type": "application/json",
+        },
+    )
+    if not response.text:
+        raise ValueError("Empty response from Gemini")
+    try:
+        data = json.loads(response.text)
+    except json.JSONDecodeError as e:
+        logger.error("Gemini: JSON parse error: %s", e)
+        raise ValueError(f"Cannot parse Gemini response: {e}")
+    return scenario_from_simple_output(data, main_asset_id, total_duration)
+
+
+def refine_scenario(
+    scenario: Scenario,
+    refinement_prompt: str,
+    assets: list[dict],
+) -> Scenario:
+    """
+    Refine existing scenario based on user prompt. No video reload.
+    """
+    if not refinement_prompt.strip():
+        raise ValueError("refinement_prompt is required")
+
+    api_key = get_gemini_api_key()
+    client = genai.Client(api_key=api_key)
+
+    scenario_json = json.dumps(scenario.model_dump(), ensure_ascii=False, indent=2)
+    prompt = (
+        f"CURRENT SCENARIO:\n{scenario_json}\n\n"
+        f"USER REFINEMENT REQUEST: {refinement_prompt}\n\n"
+        "Return the updated scenario JSON."
+    )
+
+    logger.info("Gemini: refine_scenario...")
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={
+            "system_instruction": REFINE_INSTRUCTION,
+            "response_mime_type": "application/json",
+        },
+    )
+
+    if not response.text:
+        raise ValueError("Empty response from Gemini")
+
+    try:
+        data = json.loads(response.text)
+    except json.JSONDecodeError as e:
+        logger.error("Gemini: JSON parse error: %s", e)
+        raise ValueError(f"Cannot parse Gemini response: {e}")
+
+    from services.scenario_service import (
+        ensure_video_layer_matches_scenes,
+        normalize_llm_scenario,
+        scenario_from_simple_output,
+    )
+
+    if "scenes" in data and "metadata" in data:
+        if "layers" in data and data["layers"]:
+            scenario = normalize_llm_scenario(data)
+        else:
+            main_asset_id = ""
+            if assets:
+                main_asset_id = assets[0].get("id", "") if isinstance(assets[0], dict) else getattr(assets[0], "id", "")
+            duration = scenario.metadata.total_duration_sec or 60
+            scenario = scenario_from_simple_output(data, main_asset_id, duration)
+    else:
+        raise ValueError("Invalid scenario structure from Gemini")
+
+    asset_ids = [a.get("id") if isinstance(a, dict) else getattr(a, "id", None) for a in assets if a]
+    asset_ids = [x for x in asset_ids if x]
+    if asset_ids and scenario.metadata:
+        scenario.metadata.asset_ids = asset_ids
+
+    scenario = ensure_video_layer_matches_scenes(scenario, asset_ids[0] if asset_ids else None)
+
+    errors = validate_scenario(scenario, assets)
+    for e in errors:
+        logger.warning("Scenario validation: %s", e.message)
 
     return scenario

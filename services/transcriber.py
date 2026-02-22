@@ -43,6 +43,36 @@ def _sec_to_srt(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _ensure_wav_16k(audio_path: Path, output_path: Path) -> Path:
+    """Convert audio to WAV 16kHz mono for Whisper. Handles webm, wav, mp3, etc."""
+    cmd = [
+        "ffmpeg", "-y", "-i", str(audio_path),
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        str(output_path)
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return output_path
+
+
+def transcribe_audio(audio_path: Path, model_size: str = "base") -> str:
+    """
+    Transcribe audio from file (webm, wav, mp3, etc.). Returns plain text.
+    Used for voice prompt input.
+    """
+    from faster_whisper import WhisperModel
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wav_path = Path(tmpdir) / "audio.wav"
+        _ensure_wav_16k(audio_path, wav_path)
+        logger.info("Transcriber: голосовое аудио, Whisper (model=%s)...", model_size)
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        segments_raw, _ = model.transcribe(str(wav_path))
+        plain_parts = [s.text or "" for s in segments_raw]
+        plain_text = " ".join(plain_parts).strip()
+    logger.info("Transcriber: голосовой ввод готов")
+    return plain_text
+
+
 def transcribe(video_path: Path, model_size: str = "base") -> tuple[str, list[dict], str]:
     """
     Transcribe audio from video. Returns (plain_text, segments, srt_content).
