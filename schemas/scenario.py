@@ -4,6 +4,17 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+# Positions for text overlays (thesis). Used in LLM prompts and validation.
+OVERLAY_POSITIONS = (
+    "center",
+    "top_center",
+    "bottom_center",
+    "top_left",
+    "top_right",
+    "bottom_left",
+    "bottom_right",
+)
+
 
 class AssetRef(BaseModel):
     """Reference to an asset in a scene."""
@@ -23,12 +34,15 @@ class GenerationTaskRef(BaseModel):
 
 
 class Overlay(BaseModel):
-    """Text overlay in a scene."""
+    """Text overlay in a scene (thesis-style key phrases)."""
 
     text: str = ""
     position: str = "center"
     start_sec: float = 0
     end_sec: float = 0
+    format: str = "thesis"  # thesis | (subtitle via subtitle layer)
+    font_size: Optional[int] = None
+    font_style: Optional[str] = None  # minimal | box_dark | ... or None
 
 
 class Scene(BaseModel):

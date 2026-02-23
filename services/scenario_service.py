@@ -429,10 +429,15 @@ def scenario_from_simple_output(
                 position=o.get("position", "center"),
                 start_sec=float(o.get("start_sec", 0)),
                 end_sec=float(o.get("end_sec", 0)),
+                format=o.get("format", "thesis"),
+                font_size=o.get("font_size"),
+                font_style=o.get("font_style"),
             )
             for o in s.get("overlays", [])
         ]
         for o in overlays:
+            if (o.format or "thesis") != "thesis":
+                continue  # subtitle goes to subtitle layer
             text_segments.append(
                 Segment(
                     id=f"seg_text_{len(text_segments)}",
@@ -445,7 +450,8 @@ def scenario_from_simple_output(
                     params={
                         "text": o.text,
                         "position": o.position,
-                        "font_size": 10,
+                        "font_size": o.font_size,
+                        "font_style": o.font_style,
                         "font_color": "#FFFFFF",
                     },
                 )
@@ -487,6 +493,28 @@ def scenario_from_simple_output(
                 params={"query": stock_query} if asset_source != "uploaded" else {},
             )
         )
+    # Subtitle layer from subtitle_segments (LLM output)
+    subtitle_segments_raw = raw.get("subtitle_segments") or []
+    subtitle_segments = []
+    for j, seg in enumerate(subtitle_segments_raw):
+        start = float(seg.get("start", seg.get("start_sec", 0)))
+        end = float(seg.get("end", seg.get("end_sec", start + 1)))
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        subtitle_segments.append(
+            Segment(
+                id=f"seg_subtitle_{j}",
+                start_sec=start,
+                end_sec=end,
+                asset_id=None,
+                asset_source="generated",
+                asset_status="ready",
+                scene_id=None,
+                params={"text": text},
+            )
+        )
+
     layers = [
         Layer(
             id="layer_video_1",
@@ -498,7 +526,7 @@ def scenario_from_simple_output(
         Layer(
             id="layer_audio_1",
             type="audio",
-            order=2,
+            order=3,
             segments=[
                 Segment(
                     id="seg_audio_main",
@@ -513,6 +541,11 @@ def scenario_from_simple_output(
             ],
         ),
     ]
+    if subtitle_segments:
+        layers.insert(
+            2,
+            Layer(id="layer_subtitle_1", type="subtitle", order=2, segments=subtitle_segments),
+        )
     return Scenario(version=1, metadata=meta, scenes=scenes, layers=layers)
 
 
@@ -523,13 +556,14 @@ def tasks_to_scenario(
 ) -> Scenario:
     """
     Convert PlanResponse (tasks) to Scenario (scenes + layers).
-    Handles add_text_overlay and overlay_video (B-roll) tasks.
+    Handles add_text_overlay, overlay_video (B-roll), and add_subtitles tasks.
     """
     asset_ids = [_asset_id(a) for a in assets if _asset_id(a)]
     main_asset_id = asset_ids[0] if asset_ids else "source"
 
     overlay_tasks = [t for t in plan.tasks if t.type == "add_text_overlay"]
     broll_tasks = [t for t in plan.tasks if t.type == "overlay_video"]
+    subtitle_tasks = [t for t in plan.tasks if t.type == "add_subtitles"]
 
     # Fetch stock tasks for B-roll (to get query for generation_task_id)
     fetch_stock = {t.output_id: t for t in plan.tasks if t.type == "fetch_stock_video" and t.output_id}
@@ -563,9 +597,30 @@ def tasks_to_scenario(
             position=t.params.get("position", "center"),
             start_sec=float(t.params.get("start_time", 0) or 0),
             end_sec=float(t.params.get("end_time", 2) or 2),
+            format="thesis",
         )
         for t in overlay_tasks
     ]
+
+    # Subtitle layer from add_subtitles tasks
+    subtitle_segments: list[Segment] = []
+    for t in subtitle_tasks:
+        segs = t.params.get("segments") or []
+        for s in segs:
+            start = float(s.get("start", s.get("start_sec", 0)))
+            end = float(s.get("end", s.get("end_sec", start + 1)))
+            subtitle_segments.append(
+                Segment(
+                    id=f"seg_sub_{len(subtitle_segments)}",
+                    start_sec=start,
+                    end_sec=end,
+                    asset_id=None,
+                    asset_source="generated",
+                    asset_status="ready",
+                    scene_id=None,
+                    params={"text": s.get("text", "")},
+                )
+            )
 
     # Build video layer: main segments + B-roll segments
     video_segments: list[Segment] = []
@@ -658,10 +713,11 @@ def tasks_to_scenario(
     layers = [
         Layer(id="layer_video_1", type="video", order=0, segments=video_segments),
         Layer(id="layer_text_1", type="text", order=1, segments=text_segments),
+        Layer(id="layer_subtitle_1", type="subtitle", order=2, segments=subtitle_segments),
         Layer(
             id="layer_audio_1",
             type="audio",
-            order=2,
+            order=3,
             segments=[
                 Segment(
                     id="seg_audio_main",

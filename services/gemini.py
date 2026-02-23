@@ -68,7 +68,14 @@ NEVER mix params between task types. Generate ONLY valid JSON. No markdown."""
 SCENARIO_SIMPLE_INSTRUCTION = """You are a video editor. You receive a video and a user prompt.
 Analyze the video visually and generate a scenario. The video can mix: original footage, STOCK CLIPs (from Pexels), TALKING HEAD (from original).
 
-Return ONLY valid JSON (no markdown) with this structure:
+TEXT ON SCREEN — two types (can be together, separate, or none):
+1. THESIS — key phrases, headlines (2–4 sec each). Put in scenes.overlays with format="thesis".
+2. SUBTITLES — full speech text, phrase-by-phrase. Put in root "subtitle_segments": [{"start": 0.5, "end": 1.2, "text": "..."}].
+
+Choose based on user prompt: "тезисы"/"ключевые моменты" → thesis; "субтитры"/"subtitles" → subtitle_segments; "оба" → both; "без текста" → neither.
+Subtitle source: decide by prompt ("из голоса" → voiceover_text; "транскрипция" → transcript; "с субтитрами" → voiceover if available).
+
+Return ONLY valid JSON (no markdown):
 {
   "metadata": {
     "name": "short title",
@@ -81,41 +88,43 @@ Return ONLY valid JSON (no markdown) with this structure:
     "start_sec": 0,
     "end_sec": <number>,
     "visual_description": "what happens — use 'STOCK CLIP:' or 'TALKING HEAD:' or 'original video' prefix",
+    "voiceover_text": "optional text for this scene",
     "asset_source": "uploaded" | "generated",
     "stock_query": "search query for Pexels (only if asset_source=generated)",
     "overlays": [
-      {"text": "overlay text", "position": "center|bottom|top", "start_sec": 2.0, "end_sec": 5.0},
-      ...
+      {"text": "key phrase", "position": "top_center|bottom_center|center|top_left|top_right|bottom_left|bottom_right", "format": "thesis", "start_sec": 2.0, "end_sec": 5.0}
     ]
-  }]
+  }],
+  "subtitle_segments": [{"start": 0.5, "end": 1.2, "text": "phrase text"}]
 }
 
 RULES:
-- asset_source: "uploaded" = use original video, "generated" = need stock clip (Pexels) or AI generation.
-- For scenes with stock/B-roll: set asset_source="generated", stock_query="short English search phrase" (e.g. "engineers soldering circuit board").
-- For scenes from original video (screen recording, talking head): asset_source="uploaded".
-- visual_description: start with "STOCK CLIP:" or "TALKING HEAD:" or describe original content.
-- Overlays must not overlap; each 2-4 seconds."""
+- asset_source: "uploaded" = original video, "generated" = need stock clip (Pexels).
+- overlays: format="thesis" (default), position from full list. Thesis overlays 2–4 sec each, no overlap.
+- subtitle_segments: optional. Use voiceover_text or transcript to build segments with start/end/text.
+- Theses and subtitles can coexist, be separate, or absent — follow user prompt."""
 
 # ─── Scenario to tasks (Create Scenario render) ───────────────────────────────────
 SCENARIO_TO_TASKS_INSTRUCTION = """You are a video editor. You receive a scenario (JSON) with scenes, layers, segments, and overlays.
 Your job: generate FFmpeg tasks to render this scenario to video.
 
 INPUT:
-- scenario: scenes, layers (video/audio/text), segments with start_sec/end_sec, asset_id
+- scenario: scenes, layers (video/audio/text/subtitle), segments with start_sec/end_sec, asset_id
 - broll_ids: list of available B-roll clip IDs (e.g. ["broll_1", "broll_2"]) — use these EXACT ids in overlay_video
 - overlay_style: minimal | box_dark | box_light | outline | bold_center
 
-OUTPUT: JSON with "tasks" array. Each task: { "type": "...", "params": {...} }
+OUTPUT: JSON with "tasks" array. Order: overlay_video → add_text_overlay → add_subtitles.
 
 TASK TYPES:
 1. overlay_video — for each B-roll segment (non-main video). params: start_time, end_time, stock_id (must be one of broll_ids)
-2. add_text_overlay — for each text overlay in scenes. params: text, position, start_time, end_time, font_size, font_color, shadow, background
+2. add_text_overlay — for thesis overlays in scenes (format="thesis"). params: text, position, start_time, end_time, font_size, font_color, shadow, background
+3. add_subtitles — for subtitle layer. params: segments = [{start, end, text}] (from layer type="subtitle" segments)
 
 RULES:
 - Do NOT generate fetch_stock_video — B-roll clips are already provided.
-- overlay_video: stock_id MUST be one of the given broll_ids. Match by segment order: 1st B-roll segment → broll_1, 2nd → broll_2, etc.
-- add_text_overlay: position = center|top_center|bottom_center|top_left|top_right|bottom_left|bottom_right
+- overlay_video: stock_id MUST be one of the given broll_ids.
+- add_text_overlay: only for thesis overlays (format="thesis" or overlays). position = center|top_center|bottom_center|top_left|top_right|bottom_left|bottom_right
+- add_subtitles: one task if scenario has layer type="subtitle" with segments. params.segments = [{start: seg.start_sec, end: seg.end_sec, text: seg.params.text}]
 - Return ONLY valid JSON. No markdown."""
 
 # ─── Refine scenario ────────────────────────────────────────────────────────────
@@ -128,6 +137,7 @@ Your job: apply ONLY the requested changes and return the updated scenario in th
 RULES:
 - Preserve metadata.total_duration_sec, metadata.aspect_ratio, asset_ids.
 - Preserve scene and segment IDs where possible.
+- Preserve overlay format, font_size, font_style; preserve subtitle_segments and subtitle layer.
 - Apply only what the user asked (e.g. add overlays, change text, remove B-roll, shorten).
 - Return valid JSON. No markdown."""
 
@@ -800,8 +810,8 @@ def scenario_to_llm_tasks(
             task_dict["inputs"] = t.inputs
         tasks.append(task_dict)
 
-    # Filter: only overlay_video and add_text_overlay (no fetch_stock)
-    allowed = {"overlay_video", "add_text_overlay"}
+    # Filter: overlay_video, add_text_overlay, add_subtitles (no fetch_stock)
+    allowed = {"overlay_video", "add_text_overlay", "add_subtitles"}
     tasks = [t for t in tasks if t["type"] in allowed]
 
     logger.info("Gemini: scenario_to_llm_tasks returned %d tasks", len(tasks))

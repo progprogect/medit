@@ -106,17 +106,23 @@ def _overlay_to_task_params(
     if end_time <= start_time:
         end_time = start_time + 1
 
+    # Overlay font_size/font_style override preset
+    effective_preset = preset
+    if overlay.font_style and overlay.font_style in OVERLAY_PRESETS:
+        effective_preset = OVERLAY_PRESETS[overlay.font_style]
+    font_size = overlay.font_size if overlay.font_size is not None else effective_preset.get("font_size", 48)
+
     return {
         "text": overlay.text,
         "position": overlay.position or "center",
         "start_time": start_time,
         "end_time": end_time,
-        "font_size": preset.get("font_size", 48),
-        "font_color": preset.get("font_color", "white"),
-        "shadow": preset.get("shadow", False),
-        "background": preset.get("background"),
-        "border_width": preset.get("border_width", 0),
-        "border_color": preset.get("border_color"),
+        "font_size": font_size,
+        "font_color": effective_preset.get("font_color", "white"),
+        "shadow": effective_preset.get("shadow", False),
+        "background": effective_preset.get("background"),
+        "border_width": effective_preset.get("border_width", 0),
+        "border_color": effective_preset.get("border_color"),
     }
 
 
@@ -190,17 +196,35 @@ def scenario_to_render_tasks(
         })
         broll_idx += 1
 
-    # 2. add_text_overlay for each overlay (from all scenes)
+    # 2. add_text_overlay for thesis overlays only (from scenes)
     for scene in scenario.scenes:
         for ov in scene.overlays if hasattr(scene, "overlays") else scene.get("overlays", []):
             o = Overlay(**ov) if isinstance(ov, dict) else ov
             if not o.text.strip():
                 continue
+            if (o.format or "thesis") != "thesis":
+                continue  # subtitle via subtitle layer
             params = _overlay_to_task_params(o, preset)
             tasks.append({
                 "type": "add_text_overlay",
                 "params": params,
             })
+
+    # 3. add_subtitles from subtitle layer
+    subtitle_layer = next((l for l in scenario.layers if l.type == "subtitle"), None)
+    if subtitle_layer and subtitle_layer.segments:
+        sub_segs = []
+        for seg in sorted(subtitle_layer.segments, key=lambda s: s.start_sec):
+            text = (seg.params or {}).get("text", "").strip()
+            if not text:
+                continue
+            sub_segs.append({
+                "start": seg.start_sec,
+                "end": seg.end_sec,
+                "text": text,
+            })
+        if sub_segs:
+            tasks.append({"type": "add_subtitles", "params": {"segments": sub_segs}})
 
     return tasks
 
